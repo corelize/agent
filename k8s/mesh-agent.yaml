@@ -1,0 +1,104 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-agent
+  namespace: mesh-vpn
+  labels:
+    app: mesh-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mesh-agent
+  template:
+    metadata:
+      labels:
+        app: mesh-agent
+    spec:
+      containers:
+        - name: mesh-agent
+          image: mesh-agent:latest
+          imagePullPolicy: Never  # Use local image
+          ports:
+            - containerPort: 8081
+              name: http
+            - containerPort: 8888
+              name: echo-proxy
+            - containerPort: 5432
+              name: postgres-proxy
+            - containerPort: 51820
+              hostPort: 51820
+              protocol: UDP
+              name: quic
+          env:
+            - name: MESH_CONTROL_URL
+              value: "http://host.docker.internal:8080"
+            - name: MESH_AUTH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mesh-agent-secrets
+                  key: api-key
+            - name: MESH_NETWORK_ID
+              value: "ntwk_d5b031yrt2glt5kc"
+          args:
+            - "--control"
+            - "$(MESH_CONTROL_URL)"
+            - "--auth-key"
+            - "$(MESH_AUTH_KEY)"
+            - "--network-id"
+            - "$(MESH_NETWORK_ID)"
+            - "--proxies"
+            - "8888:echo-server:80,5432:postgres:5432"
+            - "--public-ip"
+            - "192.168.139.2"
+            - "--public-port"
+            - "51820"
+            - "--verbose"
+          resources:
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+          livenessProbe:
+            tcpSocket:
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mesh-agent
+  namespace: mesh-vpn
+  labels:
+    app: mesh-agent
+spec:
+  type: NodePort
+  ports:
+    - port: 8081
+      targetPort: 8081
+      nodePort: 30081
+      name: http
+    - port: 8888
+      targetPort: 8888
+      nodePort: 30888
+      name: echo-proxy
+    - port: 5432
+      targetPort: 5432
+      nodePort: 30543
+      name: postgres-proxy
+    - port: 51820
+      targetPort: 51820
+      protocol: UDP
+      nodePort: 31820
+      name: quic
+  selector:
+    app: mesh-agent

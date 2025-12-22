@@ -1,0 +1,56 @@
+# Production values for mesh-agent
+# Uses existing secret with API key
+
+replicaCount: 1
+
+image:
+  repository: mesh-agent
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+# Mesh Agent configuration
+meshAgent:
+  # Control server URL (use host IP for kubernetes)
+  controlUrl: "http://192.168.0.133:8080"
+
+  # Network ID (dev network)
+  networkId: "ntwk_d5b031yrt2glt5kc"
+
+  # Use existing secret for auth key
+  existingSecret:
+    enabled: true
+    name: "mesh-agent-secrets"
+    key: "api-key"
+
+  # TCP proxy rules
+  proxies:
+    - localPort: 8888
+      targetHost: "echo-server"
+      targetPort: 80
+    - localPort: 5432
+      targetHost: "postgres"
+      targetPort: 5432
+
+  # Enable verbose logging
+  verbose: true
+
+  # QUIC port for P2P connections
+  quicPort: 51820
+
+  # HTTP API port
+  httpPort: 8081
+
+service:
+  type: NodePort
+  httpPort: 8081
+  httpNodePort: 30081
+  quicPort: 51820
+  quicNodePort: 31820
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

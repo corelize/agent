@@ -1,0 +1,92 @@
+# Default values for mesh-agent
+# This is a YAML-formatted file.
+
+replicaCount: 1
+
+image:
+  repository: mesh-agent
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Mesh Agent configuration
+meshAgent:
+  # Control server URL (required)
+  controlUrl: "https://vpn.zcentric.com"
+
+  # Network ID to bind the agent to
+  networkId: ""
+
+  # API key for authentication (use existingSecret for production)
+  authKey: ""
+
+  # Use existing secret for auth key
+  existingSecret:
+    enabled: false
+    name: "mesh-agent-secrets"
+    key: "api-key"
+
+  # TCP proxy rules (format: localPort:targetHost:targetPort)
+  proxies:
+    - localPort: 8888
+      targetHost: "echo-server"
+      targetPort: 80
+
+  # Enable verbose logging
+  verbose: true
+
+  # QUIC port for P2P connections
+  quicPort: 51820
+
+  # HTTP API port
+  httpPort: 8081
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+
+service:
+  type: NodePort
+  httpPort: 8081
+  httpNodePort: 30081
+  quicPort: 51820
+  quicNodePort: 31820
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Health check configuration
+livenessProbe:
+  enabled: true
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 15
+
+readinessProbe:
+  enabled: true
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10

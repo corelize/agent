@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mesh-agent.fullname" . }}
+  labels:
+    {{- include "mesh-agent.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+      name: http
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.httpNodePort }}
+      nodePort: {{ .Values.service.httpNodePort }}
+      {{- end }}
+    - port: {{ .Values.service.quicPort }}
+      targetPort: quic
+      protocol: UDP
+      name: quic
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.quicNodePort }}
+      nodePort: {{ .Values.service.quicNodePort }}
+      {{- end }}
+    {{- range .Values.meshAgent.proxies }}
+    - port: {{ .localPort }}
+      targetPort: {{ .localPort }}
+      protocol: TCP
+      name: proxy-{{ .localPort }}
+    {{- end }}
+  selector:
+    {{- include "mesh-agent.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mesh-agent.fullname" . }}
+  labels:
+    {{- include "mesh-agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mesh-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "mesh-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mesh-agent.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--control"
+            - "$(MESH_CONTROL_URL)"
+            - "--auth-key"
+            - "$(MESH_AUTH_KEY)"
+            {{- if .Values.meshAgent.networkId }}
+            - "--network-id"
+            - "{{ .Values.meshAgent.networkId }}"
+            {{- end }}
+            {{- if .Values.meshAgent.proxies }}
+            - "--proxies"
+            - "{{ include "mesh-agent.proxyArgs" . }}"
+            {{- end }}
+            {{- if .Values.meshAgent.verbose }}
+            - "--verbose"
+            {{- end }}
+          env:
+            - name: MESH_CONTROL_URL
+              value: {{ .Values.meshAgent.controlUrl | quote }}
+            - name: MESH_AUTH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mesh-agent.secretName" . }}
+                  key: {{ .Values.meshAgent.existingSecret.key | default "api-key" }}
+            {{- if .Values.meshAgent.networkId }}
+            - name: MESH_NETWORK_ID
+              value: {{ .Values.meshAgent.networkId | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.meshAgent.httpPort }}
+              protocol: TCP
+            - name: quic
+              containerPort: {{ .Values.meshAgent.quicPort }}
+              protocol: UDP
+            {{- range .Values.meshAgent.proxies }}
+            - name: proxy-{{ .localPort }}
+              containerPort: {{ .localPort }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,15 @@
+apiVersion: v2
+name: mesh-agent
+description: Mesh VPN Agent - Infrastructure proxy for mesh network
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - vpn
+  - mesh
+  - network
+  - proxy
+home: https://github.com/zcentric/mesh-agent
+maintainers:
+  - name: zcentric
+    email: support@zcentric.com
