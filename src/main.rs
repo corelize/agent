@@ -37,8 +37,8 @@ use uuid::Uuid;
 #[command(about = "Mesh VPN Agent - Infrastructure node for mesh network")]
 struct Args {
     /// Control server URL (e.g., http://localhost:8080)
-    #[arg(long, env = "MESH_CONTROL_URL")]
-    control: String,
+    #[arg(long, env = "MESH_SERVER_URL")]
+    server: String,
 
     /// Authentication key for registration
     #[arg(long, env = "MESH_AUTH_KEY")]
@@ -56,18 +56,6 @@ struct Args {
     #[arg(long, default_value = "51820")]
     quic_port: u16,
 
-    /// Public IP address to advertise (for clients to connect)
-    #[arg(long, env = "MESH_PUBLIC_IP")]
-    public_ip: Option<String>,
-
-    /// Public port to advertise (for clients to connect)
-    #[arg(long, env = "MESH_PUBLIC_PORT")]
-    public_port: Option<u16>,
-
-    /// Proxy rules (format: port:host:port,port:host:port)
-    #[arg(long)]
-    proxies: Option<String>,
-
     /// Networks to proxy (comma-separated CIDR)
     #[arg(long)]
     networks: Option<String>,
@@ -79,6 +67,10 @@ struct Args {
     /// Network ID to bind this agent to (e.g., ntwk_abc123)
     #[arg(long, env = "MESH_NETWORK_ID")]
     network_id: Option<String>,
+
+    /// Network name/slug to bind this agent to (resolved to network ID)
+    #[arg(long, env = "MESH_NETWORK")]
+    network: Option<String>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -123,10 +115,6 @@ pub struct AgentState {
     pub config: AgentConfig,
     pub resources: HashMap<String, Resource>,
     pub control_url: String,
-    /// Default backend for traffic (e.g., "echo-server:80")
-    pub default_backend: Option<String>,
-    /// Port-based proxy routing table: port -> (host, port)
-    pub proxy_backends: HashMap<u16, (String, u16)>,
     /// Auth key for control server API calls
     pub auth_key: Option<String>,
     /// Agent ID assigned by the server (UUID format)
@@ -140,8 +128,6 @@ struct RegisterRequest {
     name: String,
     public_key: String,
     listen_port: u16,
-    public_ip: Option<String>,
-    public_port: Option<u16>,
     private_ip: Option<String>,
     private_port: Option<u16>,
     networks: Vec<String>,
@@ -221,13 +207,11 @@ impl AgentConfig {
 }
 
 impl AgentState {
-    pub fn new(config: AgentConfig, control_url: String, default_backend: Option<String>, proxy_backends: HashMap<u16, (String, u16)>) -> Self {
+    pub fn new(config: AgentConfig, control_url: String) -> Self {
         Self {
             config,
             resources: HashMap::new(),
             control_url,
-            default_backend,
-            proxy_backends,
             auth_key: None,
             server_agent_id: None,
         }
@@ -242,8 +226,6 @@ impl AgentState {
 async fn register_with_control(
     state: &Arc<RwLock<AgentState>>,
     auth_key: Option<String>,
-    public_ip: Option<String>,
-    public_port: Option<u16>,
     network_id: Option<String>,
 ) -> Result<()> {
     let (url, request) = {
@@ -255,8 +237,6 @@ async fn register_with_control(
             name: state.config.name.clone(),
             public_key: state.config.public_key.clone(),
             listen_port: state.config.listen_port,
-            public_ip,
-            public_port,
             private_ip: None,
             private_port: Some(state.config.listen_port),
             networks: state.config.networks.clone(),
@@ -311,6 +291,46 @@ async fn register_with_control(
     }
 
     Ok(())
+}
+
+/// Response from network lookup by slug
+#[derive(Debug, Deserialize)]
+struct NetworkLookupResponse {
+    id: String,
+    name: String,
+    slug: String,
+}
+
+/// Resolve network slug to network ID via control server
+async fn resolve_network_slug(server_url: &str, slug: &str, auth_key: Option<&str>) -> Result<String> {
+    let url = format!("{}/api/v1/vpn/networks/by-slug/{}", server_url.trim_end_matches('/'), slug);
+
+    info!("Resolving network slug '{}' to ID", slug);
+
+    let client = reqwest::Client::new();
+    let mut req_builder = client.get(&url);
+
+    if let Some(key) = auth_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = req_builder
+        .send()
+        .await
+        .context("Failed to connect to control server for network lookup")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Network lookup failed ({}): {}", status, body);
+    }
+
+    let result: NetworkLookupResponse = response.json().await
+        .context("Failed to parse network lookup response")?;
+
+    info!("Resolved network '{}' (slug: {}) to ID: {}", result.name, result.slug, result.id);
+
+    Ok(result.id)
 }
 
 /// Send heartbeat to control server
@@ -368,7 +388,7 @@ async fn send_keepalive(state: &Arc<RwLock<AgentState>>) -> Result<()> {
 async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
     let (url, agent_id) = {
         let state = state.read().await;
-        let url = format!("{}/api/v1/resources", state.control_url.trim_end_matches('/'));
+        let url = format!("{}/api/v1/mesh/resources", state.control_url.trim_end_matches('/'));
         (url, state.config.id.clone())
     };
 
@@ -519,7 +539,12 @@ async fn keepalive_loop(state: Arc<RwLock<AgentState>>) {
 
 /// Run resource sync loop
 async fn resource_sync_loop(state: Arc<RwLock<AgentState>>) {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    // Sync immediately on first load
+    if let Err(e) = sync_resources(&state).await {
+        warn!("Initial resource sync failed: {}", e);
+    }
+
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
 
     loop {
         interval.tick().await;
@@ -541,59 +566,6 @@ fn expand_path(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
-}
-
-/// Parse default backend from proxies arg
-/// Accepts formats: "host:port" or "port:host:port" (uses first entry as default)
-fn parse_default_backend(proxies: Option<String>) -> Option<String> {
-    proxies.and_then(|p| {
-        // Take first entry if comma-separated
-        let first = p.split(',').next()?;
-        let parts: Vec<&str> = first.split(':').collect();
-
-        match parts.len() {
-            2 => {
-                // Format: "host:port"
-                Some(format!("{}:{}", parts[0], parts[1]))
-            }
-            3 => {
-                // Format: "local_port:host:target_port" - use host:target_port
-                Some(format!("{}:{}", parts[1], parts[2]))
-            }
-            _ => None,
-        }
-    })
-}
-
-/// Parse all proxy backends from proxies arg into port-based routing table
-/// Accepts format: "port:host:target_port,port:host:target_port,..."
-/// Returns HashMap<local_port, (backend_host, backend_port)>
-fn parse_proxy_backends(proxies: Option<String>) -> HashMap<u16, (String, u16)> {
-    let mut backends = HashMap::new();
-
-    if let Some(p) = proxies {
-        for entry in p.split(',') {
-            let parts: Vec<&str> = entry.trim().split(':').collect();
-
-            if parts.len() == 3 {
-                // Format: "local_port:host:target_port"
-                if let (Ok(local_port), Ok(target_port)) = (parts[0].parse::<u16>(), parts[2].parse::<u16>()) {
-                    let host = parts[1].to_string();
-                    info!("Registered proxy route: port {} -> {}:{}", local_port, host, target_port);
-                    backends.insert(local_port, (host, target_port));
-                }
-            } else if parts.len() == 2 {
-                // Format: "host:port" - use port 80 as local port
-                if let Ok(target_port) = parts[1].parse::<u16>() {
-                    let host = parts[0].to_string();
-                    info!("Registered proxy route: port 80 -> {}:{}", host, target_port);
-                    backends.insert(80, (host, target_port));
-                }
-            }
-        }
-    }
-
-    backends
 }
 
 /// Parse networks from CLI
@@ -757,11 +729,11 @@ async fn handle_quic_stream(
 
         info!("PROXY request: {}:{}", host, port);
 
-        // Look up resource by mesh_ip to find actual backend
+        // Look up resource by mesh_ip to find actual backend (synced from network)
         let backend = {
             let state = state.read().await;
 
-            // First try to find resource by mesh_ip
+            // First try to find resource by mesh_ip and port
             if let Some(resource) = state.resources.values()
                 .find(|r| r.mesh_ip == host && r.mesh_port == port)
             {
@@ -777,31 +749,12 @@ async fn handle_quic_stream(
                     resource.name, host, resource.target_host, resource.target_port);
                 Some((resource.target_host.clone(), resource.target_port))
             }
-            // Try port-based routing from proxy_backends table
+            // For mesh IPs with no resource match, log warning
             else if host.starts_with("100.64.") {
-                if let Some((backend_host, backend_port)) = state.proxy_backends.get(&port) {
-                    info!("Port-based routing: {}:{} -> {}:{}", host, port, backend_host, backend_port);
-                    Some((backend_host.clone(), *backend_port))
-                }
-                // Fall back to default_backend if no port-based route
-                else if let Some(ref backend) = state.default_backend {
-                    let backend_parts: Vec<&str> = backend.rsplitn(2, ':').collect();
-                    if backend_parts.len() == 2 {
-                        if let Ok(backend_port) = backend_parts[0].parse::<u16>() {
-                            info!("No port match for {}:{}, using default backend: {}", host, port, backend);
-                            Some((backend_parts[1].to_string(), backend_port))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    warn!("No proxy route found for mesh IP {}:{}", host, port);
-                    None
-                }
+                warn!("No resource found for mesh IP {}:{}", host, port);
+                None
             } else {
-                // Not a mesh IP, use as-is (hostname forwarding)
+                // Not a mesh IP, allow direct hostname forwarding
                 None
             }
         };
@@ -820,7 +773,7 @@ async fn handle_quic_stream(
         handle_tun_stream(send, recv, state).await?;
 
     } else {
-        // Legacy: try to find resource by mesh_ip or use default backend
+        // Legacy: try to find resource by mesh_ip
         let target = {
             let state = state.read().await;
             // Check if header looks like "mesh_ip:port"
@@ -832,15 +785,7 @@ async fn handle_quic_stream(
                     .find(|r| r.mesh_ip == ip && r.mesh_port == port)
                     .map(|r| (r.target_host.clone(), r.target_port))
             } else {
-                // Use default backend if set
-                state.default_backend.as_ref().and_then(|backend| {
-                    let parts: Vec<&str> = backend.rsplitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        parts[0].parse::<u16>().ok().map(|p| (parts[1].to_string(), p))
-                    } else {
-                        None
-                    }
-                })
+                None
             }
         };
 
@@ -848,7 +793,7 @@ async fn handle_quic_stream(
             info!("Legacy QUIC request → {}:{}", host, port);
             proxy_to_backend(send, recv, &host, port).await?;
         } else {
-            anyhow::bail!("Unknown stream header and no default backend: {}", header);
+            anyhow::bail!("Unknown stream header and no matching resource: {}", header);
         }
     }
 
@@ -951,7 +896,7 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Starting Mesh VPN Agent");
-    info!("Control server: {}", args.control);
+    info!("Control server: {}", args.server);
 
     // Load or create agent config
     let mut config = AgentConfig::load_or_create(&args.state)?;
@@ -959,31 +904,31 @@ async fn main() -> Result<()> {
     config.networks = parse_networks(args.networks.clone());
     config.advertised_routes = parse_networks(args.advertise_routes);
 
-    // Parse default backend from proxies arg (format: "host:port" or "port:host:port")
-    // This is used as fallback when no PROXY: header is provided
-    let default_backend = parse_default_backend(args.proxies.clone());
-    if let Some(ref backend) = default_backend {
-        info!("Default backend for QUIC streams: {}", backend);
-    }
+    // Create agent state (resources synced from network, no static proxies)
+    let state = Arc::new(RwLock::new(AgentState::new(config, args.server.clone())));
 
-    // Parse all proxy backends into port-based routing table
-    let proxy_backends = parse_proxy_backends(args.proxies.clone());
-    if !proxy_backends.is_empty() {
-        info!("Port-based proxy routing: {} entries", proxy_backends.len());
-    }
-
-    // Create agent state (no TCP listeners - Twingate-style architecture)
-    let state = Arc::new(RwLock::new(AgentState::new(config, args.control.clone(), default_backend, proxy_backends)));
+    // Resolve network: prefer --network-id, otherwise resolve --network slug
+    let network_id = match (args.network_id, args.network) {
+        (Some(id), _) => {
+            info!("Using network ID: {}", id);
+            Some(id)
+        }
+        (None, Some(slug)) => {
+            let id = resolve_network_slug(&args.server, &slug, args.auth_key.as_deref()).await?;
+            Some(id)
+        }
+        (None, None) => None,
+    };
 
     // Register with control server
-    if let Some(ref nid) = args.network_id {
+    if let Some(ref nid) = network_id {
         info!("Binding agent to network: {}", nid);
     }
-    register_with_control(&state, args.auth_key, args.public_ip, args.public_port, args.network_id).await?;
+    register_with_control(&state, args.auth_key.clone(), network_id).await?;
 
     info!("Agent registered successfully");
     info!("HTTP API: http://localhost:{}", args.port);
-    info!("Architecture: Twingate-style (QUIC streams only, no local TCP proxies)");
+    info!("Architecture: Twingate-style (QUIC streams, resources synced from network)");
 
     // Start background tasks
     let state_clone = state.clone();

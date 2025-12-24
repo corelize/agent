@@ -8,6 +8,8 @@ metadata:
     app: mesh-agent
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: mesh-agent
@@ -32,7 +34,7 @@ spec:
               protocol: UDP
               name: quic
           env:
-            - name: MESH_CONTROL_URL
+            - name: MESH_SERVER_URL
               value: "http://host.docker.internal:8080"
             - name: MESH_AUTH_KEY
               valueFrom:
@@ -42,18 +44,12 @@ spec:
             - name: MESH_NETWORK_ID
               value: "ntwk_d5b031yrt2glt5kc"
           args:
-            - "--control"
-            - "$(MESH_CONTROL_URL)"
+            - "--server"
+            - "$(MESH_SERVER_URL)"
             - "--auth-key"
             - "$(MESH_AUTH_KEY)"
             - "--network-id"
             - "$(MESH_NETWORK_ID)"
-            - "--proxies"
-            - "8888:echo-server:80,5432:postgres:5432"
-            - "--public-ip"
-            - "192.168.139.2"
-            - "--public-port"
-            - "51820"
             - "--verbose"
           resources:
             limits:
