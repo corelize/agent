@@ -121,6 +121,47 @@ pub struct Resource {
     pub ports: Option<String>,
 }
 
+/// Response from mesh resources list endpoint
+#[derive(Debug, Deserialize)]
+struct MeshResourceListResponse {
+    pub total: usize,
+    pub resources: Vec<MeshResourceResponse>,
+}
+
+/// Mesh resource from server (different field types)
+#[derive(Debug, Deserialize)]
+struct MeshResourceResponse {
+    pub id: String,
+    pub name: String,
+    pub hostname: String,
+    pub mesh_ip: String,
+    pub mesh_port: i32,
+    pub target_host: String,
+    pub target_port: i32,
+    pub protocol: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl From<MeshResourceResponse> for Resource {
+    fn from(r: MeshResourceResponse) -> Self {
+        Resource {
+            id: r.id,
+            name: r.name,
+            hostname: r.hostname,
+            mesh_ip: r.mesh_ip,
+            mesh_port: r.mesh_port as u16,
+            target_host: r.target_host,
+            target_port: r.target_port as u16,
+            protocol: r.protocol,
+            agent_id: r.agent_id,
+            port_mode: PortMode::All, // Default to all ports for mesh resources
+            ports: None,
+        }
+    }
+}
+
 /// Agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -413,38 +454,71 @@ async fn send_keepalive(state: &Arc<RwLock<AgentState>>) -> Result<()> {
 /// Fetch and update resources from control server
 /// Resources are used for routing QUIC streams - no local TCP proxies needed
 async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
-    let (url, agent_id) = {
+    let (url, auth_key) = {
         let state = state.read().await;
-        let url = format!("{}/api/v1/mesh/resources", state.control_url.trim_end_matches('/'));
-        (url, state.config.id.clone())
+        // Use the agents/resources endpoint which filters by agent via X-Agent-Key
+        let url = format!("{}/api/v1/agents/resources", state.control_url.trim_end_matches('/'));
+        (url, state.auth_key.clone())
     };
 
     let client = reqwest::Client::new();
-    let response = client.get(&url).send().await?;
+    let mut req_builder = client.get(&url);
+
+    // Add X-Agent-Key header for authentication
+    if let Some(ref key) = auth_key {
+        req_builder = req_builder.header("X-Agent-Key", key);
+    }
+
+    let response = req_builder.send().await?;
 
     if !response.status().is_success() {
+        debug!("Resource sync returned status: {}", response.status());
         return Ok(());
     }
 
-    let all_resources: HashMap<String, Resource> = response.json().await?;
+    // Server returns resources already filtered for this agent
+    let list_response: MeshResourceListResponse = response.json().await?;
 
-    // Filter resources for this agent
-    let my_resources: HashMap<String, Resource> = all_resources
+    // Convert to HashMap<id, Resource>
+    let my_resources: HashMap<String, Resource> = list_response.resources
         .into_iter()
-        .filter(|(_, r)| r.agent_id == agent_id)
+        .map(|r| {
+            let id = r.id.clone();
+            (id, Resource::from(r))
+        })
         .collect();
 
     // Check if resources changed
     let resources_changed = {
         let state = state.read().await;
-        state.resources.len() != my_resources.len()
-            || my_resources.iter().any(|(id, new_res)| {
-                state.resources.get(id).map_or(true, |old_res| {
-                    old_res.mesh_port != new_res.mesh_port
+        let len_changed = state.resources.len() != my_resources.len();
+
+        if len_changed {
+            debug!("Resource count changed: {} -> {}", state.resources.len(), my_resources.len());
+        }
+
+        let content_changed = my_resources.iter().any(|(id, new_res)| {
+            match state.resources.get(id) {
+                None => {
+                    debug!("New resource ID not in state: {}", id);
+                    true
+                }
+                Some(old_res) => {
+                    let changed = old_res.mesh_port != new_res.mesh_port
                         || old_res.target_host != new_res.target_host
-                        || old_res.target_port != new_res.target_port
-                })
-            })
+                        || old_res.target_port != new_res.target_port;
+                    if changed {
+                        debug!("Resource {} changed: port {}->{}  host {}->{}  target_port {}->{}",
+                            id, old_res.mesh_port, new_res.mesh_port,
+                            old_res.target_host, new_res.target_host,
+                            old_res.target_port, new_res.target_port);
+                    }
+                    changed
+                }
+            }
+        });
+
+        len_changed || content_changed
     };
 
     if resources_changed {
