@@ -72,6 +72,10 @@ struct Args {
     #[arg(long, env = "MESH_NETWORK")]
     network: Option<String>,
 
+    /// Agent display name (shown in frontend)
+    #[arg(long, env = "MESH_AGENT_NAME")]
+    name: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -81,17 +85,40 @@ struct Args {
 // Data Models
 // =============================================================================
 
+/// Port mode for resource access
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortMode {
+    /// All ports allowed
+    All,
+    /// Specific ports only
+    Specific,
+}
+
+impl Default for PortMode {
+    fn default() -> Self {
+        PortMode::All
+    }
+}
+
 /// Resource represents a backend service exposed via mesh
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource {
     pub id: String,
     pub name: String,
+    /// Internal DNS hostname (e.g., nginx.do.int)
+    pub hostname: String,
     pub mesh_ip: String,
     pub mesh_port: u16,
     pub target_host: String,
     pub target_port: u16,
     pub protocol: String,
     pub agent_id: String,
+    /// Port mode: all ports or specific
+    #[serde(default)]
+    pub port_mode: PortMode,
+    /// Specific ports (comma-separated, e.g., "80/tcp, 443/tcp")
+    pub ports: Option<String>,
 }
 
 /// Agent configuration
@@ -422,6 +449,20 @@ async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
 
     if resources_changed {
         info!("Resource configuration updated - {} resources available for QUIC routing", my_resources.len());
+
+        // Log each resource for visibility
+        for (_id, resource) in &my_resources {
+            if resource.port_mode == PortMode::Specific {
+                if let Some(ref ports) = resource.ports {
+                    info!("  → {} → {} ({})", resource.hostname, resource.target_host, ports);
+                } else {
+                    info!("  → {} → {}", resource.hostname, resource.target_host);
+                }
+            } else {
+                info!("  → {} → {}", resource.hostname, resource.target_host);
+            }
+        }
+
         let mut state = state.write().await;
         state.resources = my_resources;
     }
@@ -540,8 +581,16 @@ async fn keepalive_loop(state: Arc<RwLock<AgentState>>) {
 /// Run resource sync loop
 async fn resource_sync_loop(state: Arc<RwLock<AgentState>>) {
     // Sync immediately on first load
+    info!("Loading resources from control server...");
     if let Err(e) = sync_resources(&state).await {
         warn!("Initial resource sync failed: {}", e);
+    } else {
+        let state = state.read().await;
+        if state.resources.is_empty() {
+            info!("No resources assigned to this agent yet");
+        } else {
+            info!("Initial resource load complete - {} resources ready", state.resources.len());
+        }
     }
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -903,6 +952,12 @@ async fn main() -> Result<()> {
     config.listen_port = args.quic_port;
     config.networks = parse_networks(args.networks.clone());
     config.advertised_routes = parse_networks(args.advertise_routes);
+
+    // Override agent name if provided via CLI
+    if let Some(custom_name) = args.name.clone() {
+        info!("Using custom agent name: {}", custom_name);
+        config.name = custom_name;
+    }
 
     // Create agent state (resources synced from network, no static proxies)
     let state = Arc::new(RwLock::new(AgentState::new(config, args.server.clone())));
