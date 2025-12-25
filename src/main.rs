@@ -13,7 +13,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use quinn::{Endpoint, ServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rand::rngs::OsRng;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -66,9 +66,14 @@ struct Args {
     #[arg(long, default_value = "8081")]
     port: u16,
 
-    /// QUIC listen port
+    /// QUIC listen port (ignored when --relay-url is set)
     #[arg(long, default_value = "51820")]
     quic_port: u16,
+
+    /// Relay server URL for NAT traversal (e.g., 1.2.3.4:8443)
+    /// When set, agent connects OUTBOUND to relay instead of listening on quic_port
+    #[arg(long, env = "MESH_RELAY_URL")]
+    relay_url: Option<String>,
 
     /// Networks to proxy (comma-separated CIDR)
     #[arg(long)]
@@ -201,6 +206,10 @@ pub struct AgentState {
     pub auth_key: Option<String>,
     /// Agent ID assigned by the server (UUID format)
     pub server_agent_id: Option<String>,
+    /// Token for authenticating with relay server
+    pub relay_token: Option<String>,
+    /// Network ID for re-registration
+    pub network_id: Option<String>,
 }
 
 /// Registration request
@@ -228,6 +237,8 @@ struct RegisterResponse {
     agent_id: String,
     mesh_ip: String,
     mesh_cidr: Option<String>,
+    /// Token for authenticating with relay server
+    relay_token: String,
 }
 
 // =============================================================================
@@ -296,6 +307,8 @@ impl AgentState {
             control_url,
             auth_key: None,
             server_agent_id: None,
+            relay_token: None,
+            network_id: None,
         }
     }
 }
@@ -310,7 +323,7 @@ async fn register_with_control(
     auth_key: Option<String>,
     network_id: Option<String>,
 ) -> Result<()> {
-    let (url, request) = {
+    let (url, request, network_id) = {
         let state = state.read().await;
         let url = format!("{}/api/v1/agents/register", state.control_url.trim_end_matches('/'));
 
@@ -332,12 +345,12 @@ async fn register_with_control(
             networks: state.config.networks.clone(),
             advertised_routes: state.config.advertised_routes.clone(),
             auth_key: auth_key.clone(),
-            network_id,
+            network_id: network_id.clone(),
             agent_type: "proxy".to_string(),
             transport_type: "quic".to_string(),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
-        (url, request)
+        (url, request, network_id)
     };
 
     info!("Registering with control server: {}", url);
@@ -370,12 +383,16 @@ async fn register_with_control(
             state.config.mesh_blocks = vec![cidr.clone()];
         }
         state.config.registered_at = Some(Utc::now());
-        // Store auth_key and server-assigned agent_id for heartbeats
+        // Store auth_key, network_id, and server-assigned agent_id for re-registration
         state.auth_key = auth_key.clone();
+        state.network_id = network_id.clone();
         state.server_agent_id = Some(result.agent_id.clone());
+        // Store relay token for relay server authentication
+        state.relay_token = Some(result.relay_token.clone());
     }
 
     info!("Registered - Assigned IP: {}, Agent ID: {}", result.mesh_ip, result.agent_id);
+    info!("Relay token received for relay server authentication");
     if let Some(ref cidr) = result.mesh_cidr {
         info!("Mesh CIDR: {}", cidr);
     }
@@ -699,6 +716,35 @@ async fn resource_sync_loop(state: Arc<RwLock<AgentState>>) {
     }
 }
 
+/// Run periodic re-registration loop to refresh relay token
+/// Re-registers every 10 minutes to ensure relay token stays valid
+async fn reregistration_loop(state: Arc<RwLock<AgentState>>) {
+    // Wait 10 minutes before first re-registration (initial registration already done)
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600));
+    interval.tick().await; // Skip the first immediate tick
+
+    loop {
+        interval.tick().await;
+
+        // Get auth_key and network_id from state for re-registration
+        let (auth_key, network_id) = {
+            let s = state.read().await;
+            (s.auth_key.clone(), s.network_id.clone())
+        };
+
+        info!("Re-registering with control server to refresh relay token...");
+
+        match register_with_control(&state, auth_key, network_id).await {
+            Ok(()) => {
+                info!("Re-registration successful - relay token refreshed");
+            }
+            Err(e) => {
+                warn!("Re-registration failed: {} - will retry in 10 minutes", e);
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Utilities
 // =============================================================================
@@ -795,6 +841,275 @@ async fn run_quic_server(state: Arc<RwLock<AgentState>>, quic_port: u16) -> Resu
     Ok(())
 }
 
+// =============================================================================
+// Relay Client (for NAT traversal)
+// =============================================================================
+
+/// Skip server certificate verification for relay connections (development)
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// Create QUIC client config for relay connections
+fn create_relay_client_config() -> Result<ClientConfig> {
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    // Match the relay server's ALPN protocol
+    crypto.alpn_protocols = vec![b"mesh-relay".to_vec()];
+
+    let mut client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .context("Failed to create QUIC client config")?,
+    ));
+
+    // Configure transport for long-lived connection
+    // Agent sends QUIC-level PINGs every 15s, timeout after 5 minutes of no activity
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(300)  // 5 minutes - matches relay
+            .try_into()
+            .unwrap(),
+    ));
+    client_config.transport_config(Arc::new(transport_config));
+
+    Ok(client_config)
+}
+
+/// Connect to relay server and handle forwarded streams
+/// This is the Twingate-style relay mode where agent connects OUTBOUND
+async fn run_relay_client(
+    state: Arc<RwLock<AgentState>>,
+    relay_addr: SocketAddr,
+    agent_id: String,
+    relay_token: String,
+) -> Result<()> {
+    // Install rustls crypto provider
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let client_config = create_relay_client_config()?;
+
+    info!("Connecting to relay server: {}", relay_addr);
+
+    // Create client endpoint
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)
+        .context("Failed to create QUIC client endpoint")?;
+    endpoint.set_default_client_config(client_config);
+
+    // Connect to relay
+    let connection = endpoint
+        .connect(relay_addr, "mesh-relay")?
+        .await
+        .context("Failed to connect to relay server")?;
+
+    info!("Connected to relay server: {}", relay_addr);
+
+    // Register with relay by sending RELAY:AGENT:agent_id:relay_token header
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("Failed to open registration stream")?;
+
+    let registration = format!("RELAY:AGENT:{}:{}\n", agent_id, relay_token);
+    send.write_all(registration.as_bytes()).await?;
+    send.flush().await?;
+
+    // Wait for acknowledgment
+    let mut ack_buf = vec![0u8; 64];
+    let mut ack_len = 0;
+    loop {
+        match recv.read(&mut ack_buf[ack_len..]).await? {
+            Some(n) => {
+                ack_len += n;
+                if ack_buf[..ack_len].contains(&b'\n') {
+                    break;
+                }
+            }
+            None => anyhow::bail!("Connection closed before acknowledgment"),
+        }
+    }
+
+    let ack = String::from_utf8_lossy(&ack_buf[..ack_len]);
+    let ack_trimmed = ack.trim();
+    if ack_trimmed != "OK" {
+        if ack_trimmed.starts_with("ERROR:") {
+            let error_msg = ack_trimmed.trim_start_matches("ERROR:");
+            anyhow::bail!("Relay authentication failed: {}", error_msg);
+        }
+        anyhow::bail!("Relay registration failed: {}", ack_trimmed);
+    }
+
+    info!("Authenticated with relay as agent: {}", agent_id);
+    info!("Relay mode active - accepting forwarded streams from clients");
+
+    // Accept forwarded streams from relay AND send periodic keepalives
+    // The relay opens bi-streams to us when clients request routing
+    let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+    keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            // Accept incoming streams from relay (client forwarding)
+            result = connection.accept_bi() => {
+                match result {
+                    Ok((send, recv)) => {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_quic_stream(send, recv, state).await {
+                                debug!("Relay stream error: {}", e);
+                            }
+                        });
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(reason)) => {
+                        info!("Relay connection closed: {:?}", reason);
+                        break;
+                    }
+                    Err(quinn::ConnectionError::TimedOut) => {
+                        warn!("Relay connection timed out - reconnecting...");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Relay accept_bi error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Send periodic application-level keepalives to relay
+            _ = keepalive_interval.tick() => {
+                match connection.open_bi().await {
+                    Ok((mut send, mut recv)) => {
+                        if let Err(e) = send.write_all(b"KEEPALIVE\n").await {
+                            warn!("Failed to send keepalive: {}", e);
+                            break;
+                        }
+                        if let Err(e) = send.flush().await {
+                            warn!("Failed to flush keepalive: {}", e);
+                            break;
+                        }
+                        // Wait for OK response - if this fails, connection is dead
+                        let mut buf = [0u8; 16];
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            recv.read(&mut buf)
+                        ).await {
+                            Ok(Ok(Some(_))) => {
+                                debug!("Relay keepalive OK");
+                            }
+                            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                                warn!("Keepalive response failed - reconnecting");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to open keepalive stream: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run relay client with automatic reconnection
+async fn run_relay_client_loop(
+    state: Arc<RwLock<AgentState>>,
+    relay_url: String,
+) -> Result<()> {
+    // Try parsing as SocketAddr first (IP:port), otherwise resolve as hostname:port
+    let relay_addr: SocketAddr = match relay_url.parse() {
+        Ok(addr) => addr,
+        Err(_) => {
+            // Resolve hostname:port format
+            use tokio::net::lookup_host;
+            let addrs: Vec<SocketAddr> = lookup_host(&relay_url)
+                .await
+                .context(format!("Failed to resolve relay URL: {}", relay_url))?
+                .collect();
+            addrs.into_iter().next()
+                .ok_or_else(|| anyhow::anyhow!("No addresses found for relay URL: {}", relay_url))?
+        }
+    };
+
+    // Get agent_id and relay_token from state
+    let (agent_id, relay_token) = {
+        let s = state.read().await;
+        let id = s.server_agent_id.clone().unwrap_or_else(|| s.config.id.clone());
+        let token = s.relay_token.clone().ok_or_else(|| {
+            anyhow::anyhow!("No relay token available - agent may not be registered")
+        })?;
+        (id, token)
+    };
+
+    loop {
+        match run_relay_client(state.clone(), relay_addr, agent_id.clone(), relay_token.clone()).await {
+            Ok(()) => {
+                info!("Relay connection closed gracefully");
+            }
+            Err(e) => {
+                error!("Relay connection error: {}", e);
+            }
+        }
+
+        // Wait before reconnecting
+        info!("Reconnecting to relay in 5 seconds...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 /// Handle incoming QUIC connection
 async fn handle_quic_connection(
     connecting: quinn::Incoming,
@@ -874,12 +1189,20 @@ async fn handle_quic_stream(
 
         info!("PROXY request: {}:{}", host, port);
 
-        // Look up resource by mesh_ip to find actual backend (synced from network)
+        // Look up resource by hostname or mesh_ip to find actual backend (synced from network)
         let backend = {
             let state = state.read().await;
 
-            // First try to find resource by mesh_ip and port
+            // First try to find resource by hostname (e.g., echo.dev.int)
             if let Some(resource) = state.resources.values()
+                .find(|r| r.hostname == host)
+            {
+                info!("Found resource '{}' for hostname {} -> {}:{}",
+                    resource.name, host, resource.target_host, resource.target_port);
+                Some((resource.target_host.clone(), resource.target_port))
+            }
+            // Then try to find resource by mesh_ip and port
+            else if let Some(resource) = state.resources.values()
                 .find(|r| r.mesh_ip == host && r.mesh_port == port)
             {
                 info!("Found resource '{}' for {}:{} -> {}:{}",
@@ -899,7 +1222,7 @@ async fn handle_quic_stream(
                 warn!("No resource found for mesh IP {}:{}", host, port);
                 None
             } else {
-                // Not a mesh IP, allow direct hostname forwarding
+                // Not a mesh IP or known hostname, allow direct hostname forwarding
                 None
             }
         };
@@ -1088,19 +1411,40 @@ async fn main() -> Result<()> {
     let state_clone = state.clone();
     tokio::spawn(resource_sync_loop(state_clone));
 
+    // Re-registration loop to refresh relay token every 10 minutes
+    let state_clone = state.clone();
+    tokio::spawn(reregistration_loop(state_clone));
+
     // NOTE: No TCP proxy listeners started - all traffic flows through QUIC streams
     // Clients send "PROXY:host:port\n" header to request proxy connections
 
-    // Start QUIC server for VPN clients
-    let quic_port = args.quic_port;
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_quic_server(state_clone, quic_port).await {
-            error!("QUIC server error: {}", e);
-        }
-    });
+    // Choose between relay mode (outbound connection) or direct QUIC server
+    if let Some(relay_url) = args.relay_url {
+        // Relay mode: connect OUTBOUND to relay server
+        // No port exposure required - works behind NAT
+        info!("Relay mode enabled - connecting to: {}", relay_url);
+        info!("No port exposure required (NAT-friendly)");
 
-    info!("QUIC server: udp://0.0.0.0:{}", quic_port);
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_relay_client_loop(state_clone, relay_url).await {
+                error!("Relay client error: {}", e);
+            }
+        });
+    } else {
+        // Direct mode: listen on QUIC port for incoming connections
+        // Requires port exposure (firewall/NAT traversal)
+        let quic_port = args.quic_port;
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_quic_server(state_clone, quic_port).await {
+                error!("QUIC server error: {}", e);
+            }
+        });
+
+        info!("QUIC server: udp://0.0.0.0:{}", quic_port);
+        info!("Direct mode - port {} must be accessible to clients", quic_port);
+    }
 
     // Run health server (blocks until shutdown)
     run_health_server(state, args.port).await?;
