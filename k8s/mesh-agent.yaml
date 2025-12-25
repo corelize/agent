@@ -42,7 +42,7 @@ spec:
                   name: mesh-agent-secrets
                   key: api-key
             - name: MESH_NETWORK_ID
-              value: "ntwk_d5b031yrt2glt5kc"
+              value: "ntwk_95963d054c4541bea9ef"
           args:
             - "--server"
             - "$(MESH_SERVER_URL)"

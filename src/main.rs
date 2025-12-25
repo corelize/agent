@@ -29,6 +29,20 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Detect the local IP address by connecting to a known external address
+fn get_local_ip() -> Option<String> {
+    // Use a UDP socket to detect the local IP that can reach external networks
+    // We don't actually send anything, just get the local address
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
+}
+
+// =============================================================================
 // CLI Arguments
 // =============================================================================
 
@@ -300,12 +314,20 @@ async fn register_with_control(
         let state = state.read().await;
         let url = format!("{}/api/v1/agents/register", state.control_url.trim_end_matches('/'));
 
+        // Detect local IP for client connectivity
+        let local_ip = get_local_ip();
+        if let Some(ref ip) = local_ip {
+            info!("Detected local IP: {}", ip);
+        } else {
+            warn!("Could not detect local IP - clients may not be able to connect directly");
+        }
+
         let request = RegisterRequest {
             agent_id: state.config.id.clone(),
             name: state.config.name.clone(),
             public_key: state.config.public_key.clone(),
             listen_port: state.config.listen_port,
-            private_ip: None,
+            private_ip: local_ip,
             private_port: Some(state.config.listen_port),
             networks: state.config.networks.clone(),
             advertised_routes: state.config.advertised_routes.clone(),
