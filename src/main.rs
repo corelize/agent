@@ -279,7 +279,8 @@ impl AgentConfig {
         let public_key = BASE64.encode(verifying_key.as_bytes());
         let private_key = BASE64.encode(signing_key.as_bytes());
 
-        let id = Uuid::new_v4().to_string()[..8].to_string();
+        // Generate full UUID for unique agent identity (persisted across restarts)
+        let id = Uuid::new_v4().to_string();
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "agent".to_string());
@@ -391,7 +392,12 @@ async fn register_with_control(
         state.relay_token = Some(result.relay_token.clone());
     }
 
-    info!("Registered - Assigned IP: {}, Agent ID: {}", result.mesh_ip, result.agent_id);
+    // Log both local agent ID (used for relay) and server-assigned ID
+    {
+        let s = state.read().await;
+        info!("Registered - Assigned IP: {}, Local Agent ID: {}, Server Agent ID: {}",
+              result.mesh_ip, s.config.id, result.agent_id);
+    }
     info!("Relay token received for relay server authentication");
     if let Some(ref cidr) = result.mesh_cidr {
         info!("Mesh CIDR: {}", cidr);
@@ -1085,9 +1091,11 @@ async fn run_relay_client_loop(
     };
 
     // Get agent_id and relay_token from state
+    // Always use the local config.id (persisted UUID) for relay registration
+    // This ensures each agent instance has a unique identity even with shared auth keys
     let (agent_id, relay_token) = {
         let s = state.read().await;
-        let id = s.server_agent_id.clone().unwrap_or_else(|| s.config.id.clone());
+        let id = s.config.id.clone();
         let token = s.relay_token.clone().ok_or_else(|| {
             anyhow::anyhow!("No relay token available - agent may not be registered")
         })?;
