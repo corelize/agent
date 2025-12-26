@@ -1222,7 +1222,8 @@ async fn handle_quic_stream(
         info!("PROXY request: {}:{}", host, port);
 
         // Look up resource by hostname or mesh_ip to find actual backend (synced from network)
-        let backend = {
+        // Port enforcement: if mesh_port is set (non-zero), only that port is allowed
+        let backend: Result<Option<(String, u16)>, String> = {
             let state = state.read().await;
 
             // Helper: determine effective target port
@@ -1235,14 +1236,27 @@ async fn handle_quic_stream(
                 }
             };
 
+            // Helper: check if request port is allowed for this resource
+            // If mesh_port is 0 (any port) or matches request port, it's allowed
+            let port_allowed = |resource: &Resource, request_port: u16| -> bool {
+                resource.mesh_port == 0 || resource.mesh_port == request_port
+            };
+
             // First try to find resource by hostname (e.g., echo.dev.int)
             if let Some(resource) = state.resources.values()
                 .find(|r| r.hostname == host)
             {
-                let target_port = effective_port(resource, port);
-                info!("Found resource '{}' for hostname {} -> {}:{} (configured port: {})",
-                    resource.name, host, resource.target_host, target_port, resource.target_port);
-                Some((resource.target_host.clone(), target_port))
+                // Enforce port restriction
+                if !port_allowed(resource, port) {
+                    warn!("Port {} not allowed for resource '{}' (allowed port: {})",
+                        port, resource.name, resource.mesh_port);
+                    Err(format!("Port {} not allowed for {}", port, host))
+                } else {
+                    let target_port = effective_port(resource, port);
+                    info!("Found resource '{}' for hostname {} -> {}:{} (mesh_port: {}, target_port: {})",
+                        resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
+                    Ok(Some((resource.target_host.clone(), target_port)))
+                }
             }
             // Then try to find resource by mesh_ip and port
             else if let Some(resource) = state.resources.values()
@@ -1251,24 +1265,41 @@ async fn handle_quic_stream(
                 let target_port = effective_port(resource, port);
                 info!("Found resource '{}' for {}:{} -> {}:{} (configured port: {})",
                     resource.name, host, port, resource.target_host, target_port, resource.target_port);
-                Some((resource.target_host.clone(), target_port))
+                Ok(Some((resource.target_host.clone(), target_port)))
             }
             // Also try matching just mesh_ip with any port
             else if let Some(resource) = state.resources.values()
                 .find(|r| r.mesh_ip == host)
             {
-                let target_port = effective_port(resource, port);
-                info!("Found resource '{}' by IP only for {} -> {}:{} (configured port: {})",
-                    resource.name, host, resource.target_host, target_port, resource.target_port);
-                Some((resource.target_host.clone(), target_port))
+                // Enforce port restriction for mesh_ip matches too
+                if !port_allowed(resource, port) {
+                    warn!("Port {} not allowed for resource '{}' at {} (allowed port: {})",
+                        port, resource.name, host, resource.mesh_port);
+                    Err(format!("Port {} not allowed for {}", port, host))
+                } else {
+                    let target_port = effective_port(resource, port);
+                    info!("Found resource '{}' by IP only for {} -> {}:{} (mesh_port: {}, target_port: {})",
+                        resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
+                    Ok(Some((resource.target_host.clone(), target_port)))
+                }
             }
             // For mesh IPs with no resource match, log warning
             else if host.starts_with("100.64.") {
                 warn!("No resource found for mesh IP {}:{}", host, port);
-                None
+                Ok(None)
             } else {
                 // Not a mesh IP or known hostname, allow direct hostname forwarding
-                None
+                Ok(None)
+            }
+        };
+
+        // Handle port rejection
+        let backend = match backend {
+            Ok(b) => b,
+            Err(msg) => {
+                send.write_all(format!("ERROR:{}\n", msg).as_bytes()).await?;
+                send.finish().ok();
+                return Ok(());
             }
         };
 
