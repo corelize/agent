@@ -520,11 +520,11 @@ async fn send_keepalive(state: &Arc<RwLock<AgentState>>) -> Result<()> {
 /// Fetch and update resources from control server
 /// Resources are used for routing QUIC streams - no local TCP proxies needed
 async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
-    let (url, auth_key) = {
+    let (url, auth_key, agent_name) = {
         let state = state.read().await;
-        // Use the agents/resources endpoint which filters by agent via X-Agent-Key
+        // Use the agents/resources endpoint which filters by agent via X-Agent-Key + X-Agent-Name
         let url = format!("{}/api/v1/agents/resources", state.control_url.trim_end_matches('/'));
-        (url, state.auth_key.clone())
+        (url, state.auth_key.clone(), state.config.name.clone())
     };
 
     let client = reqwest::Client::new();
@@ -534,6 +534,9 @@ async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
     if let Some(ref key) = auth_key {
         req_builder = req_builder.header("X-Agent-Key", key);
     }
+
+    // Add X-Agent-Name header for agent identification (allows sharing auth keys)
+    req_builder = req_builder.header("X-Agent-Name", &agent_name);
 
     let response = req_builder.send().await?;
 
