@@ -1177,7 +1177,7 @@ async fn handle_quic_connection(
 ///   - "PROXY:host:port\n" → TCP proxy to host:port
 ///   - "TUN:\n" → IP packet tunneling (parse IP headers)
 async fn handle_quic_stream(
-    send: quinn::SendStream,
+    mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     state: Arc<RwLock<AgentState>>,
 ) -> Result<()> {
@@ -1263,6 +1263,13 @@ async fn handle_quic_stream(
 
         info!("Proxying to backend: {}:{}", backend_host, backend_port);
         proxy_to_backend(send, recv, &backend_host, backend_port).await?;
+
+    } else if header.starts_with("HEALTH:") {
+        // Health check from VPN client - respond with OK
+        debug!("Health check received");
+        send.write_all(b"OK\n").await?;
+        send.finish().ok();
+        return Ok(());
 
     } else if header.starts_with("TUN:") {
         // TUN packet mode - for future IP packet handling
