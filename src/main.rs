@@ -1225,29 +1225,42 @@ async fn handle_quic_stream(
         let backend = {
             let state = state.read().await;
 
+            // Helper: determine effective target port
+            // If resource.target_port is 0, use the request port (passthrough mode)
+            let effective_port = |resource: &Resource, request_port: u16| -> u16 {
+                if resource.target_port == 0 {
+                    request_port  // Passthrough: use port from request
+                } else {
+                    resource.target_port  // Fixed port: use configured port
+                }
+            };
+
             // First try to find resource by hostname (e.g., echo.dev.int)
             if let Some(resource) = state.resources.values()
                 .find(|r| r.hostname == host)
             {
-                info!("Found resource '{}' for hostname {} -> {}:{}",
-                    resource.name, host, resource.target_host, resource.target_port);
-                Some((resource.target_host.clone(), resource.target_port))
+                let target_port = effective_port(resource, port);
+                info!("Found resource '{}' for hostname {} -> {}:{} (configured port: {})",
+                    resource.name, host, resource.target_host, target_port, resource.target_port);
+                Some((resource.target_host.clone(), target_port))
             }
             // Then try to find resource by mesh_ip and port
             else if let Some(resource) = state.resources.values()
                 .find(|r| r.mesh_ip == host && r.mesh_port == port)
             {
-                info!("Found resource '{}' for {}:{} -> {}:{}",
-                    resource.name, host, port, resource.target_host, resource.target_port);
-                Some((resource.target_host.clone(), resource.target_port))
+                let target_port = effective_port(resource, port);
+                info!("Found resource '{}' for {}:{} -> {}:{} (configured port: {})",
+                    resource.name, host, port, resource.target_host, target_port, resource.target_port);
+                Some((resource.target_host.clone(), target_port))
             }
             // Also try matching just mesh_ip with any port
             else if let Some(resource) = state.resources.values()
                 .find(|r| r.mesh_ip == host)
             {
-                info!("Found resource '{}' by IP only for {} -> {}:{}",
-                    resource.name, host, resource.target_host, resource.target_port);
-                Some((resource.target_host.clone(), resource.target_port))
+                let target_port = effective_port(resource, port);
+                info!("Found resource '{}' by IP only for {} -> {}:{} (configured port: {})",
+                    resource.name, host, resource.target_host, target_port, resource.target_port);
+                Some((resource.target_host.clone(), target_port))
             }
             // For mesh IPs with no resource match, log warning
             else if host.starts_with("100.64.") {
