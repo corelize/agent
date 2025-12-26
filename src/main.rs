@@ -91,7 +91,8 @@ struct Args {
     #[arg(long, env = "MESH_NETWORK")]
     network: Option<String>,
 
-    /// Agent display name (shown in frontend)
+    /// Agent name - used as unique identifier (required for multi-agent deployments)
+    /// This name must be unique across all agents in your organization
     #[arg(long, env = "MESH_AGENT_NAME")]
     name: Option<String>,
 
@@ -247,7 +248,8 @@ struct RegisterResponse {
 
 impl AgentConfig {
     /// Load or create agent configuration
-    pub fn load_or_create(state_dir: &str) -> Result<Self> {
+    /// If agent_name is provided, it will be used as the unique agent ID
+    pub fn load_or_create(state_dir: &str, agent_name: Option<&str>) -> Result<Self> {
         let state_path = expand_path(state_dir);
         std::fs::create_dir_all(&state_path)?;
 
@@ -255,13 +257,26 @@ impl AgentConfig {
 
         if config_file.exists() {
             let data = std::fs::read_to_string(&config_file)?;
-            let config: AgentConfig = serde_json::from_str(&data)?;
+            let mut config: AgentConfig = serde_json::from_str(&data)?;
+
+            // If a name is provided and differs from stored ID, update the config
+            if let Some(name) = agent_name {
+                if config.id != name {
+                    info!("Updating agent ID from {} to {}", config.id, name);
+                    config.id = name.to_string();
+                    config.name = name.to_string();
+                    // Save updated config
+                    let data = serde_json::to_string_pretty(&config)?;
+                    std::fs::write(&config_file, data)?;
+                }
+            }
+
             info!("Loaded agent config: {}", config.id);
             return Ok(config);
         }
 
-        // Generate new config
-        let config = Self::generate()?;
+        // Generate new config with optional name as ID
+        let config = Self::generate(agent_name)?;
 
         // Save config
         let data = serde_json::to_string_pretty(&config)?;
@@ -272,22 +287,28 @@ impl AgentConfig {
     }
 
     /// Generate new agent configuration with Ed25519 keypair
-    fn generate() -> Result<Self> {
+    /// If agent_name is provided, it will be used as both ID and name
+    fn generate(agent_name: Option<&str>) -> Result<Self> {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key: VerifyingKey = (&signing_key).into();
 
         let public_key = BASE64.encode(verifying_key.as_bytes());
         let private_key = BASE64.encode(signing_key.as_bytes());
 
-        // Generate full UUID for unique agent identity (persisted across restarts)
-        let id = Uuid::new_v4().to_string();
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "agent".to_string());
+        // Use provided name as ID, or generate UUID if not provided
+        let (id, name) = if let Some(agent_name) = agent_name {
+            (agent_name.to_string(), agent_name.to_string())
+        } else {
+            let hostname = hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "agent".to_string());
+            let id = Uuid::new_v4().to_string();
+            (id, format!("{}-agent", hostname))
+        };
 
         Ok(Self {
             id,
-            name: format!("{}-agent", hostname),
+            name,
             public_key,
             private_key,
             listen_port: 51820,
@@ -1374,17 +1395,13 @@ async fn main() -> Result<()> {
     info!("Starting Mesh VPN Agent");
     info!("Control server: {}", args.server);
 
-    // Load or create agent config
-    let mut config = AgentConfig::load_or_create(&args.state)?;
+    // Load or create agent config (name is used as unique ID if provided)
+    let mut config = AgentConfig::load_or_create(&args.state, args.name.as_deref())?;
     config.listen_port = args.quic_port;
     config.networks = parse_networks(args.networks.clone());
     config.advertised_routes = parse_networks(args.advertise_routes);
 
-    // Override agent name if provided via CLI
-    if let Some(custom_name) = args.name.clone() {
-        info!("Using custom agent name: {}", custom_name);
-        config.name = custom_name;
-    }
+    info!("Agent ID: {}", config.id);
 
     // Create agent state (resources synced from network, no static proxies)
     let state = Arc::new(RwLock::new(AgentState::new(config, args.server.clone())));

@@ -44,7 +44,9 @@ spec:
             - name: MESH_NETWORK_ID
               value: "ntwk_95963d054c4541bea9ef"
             - name: MESH_RELAY_URL
-              value: "host.docker.internal:8443"
+              value: "35.91.217.191:8443"
+            - name: MESH_AGENT_NAME
+              value: "k8s-agent"
           args:
             - "--server"
             - "$(MESH_SERVER_URL)"
@@ -54,6 +56,8 @@ spec:
             - "$(MESH_NETWORK_ID)"
             - "--relay-url"
             - "$(MESH_RELAY_URL)"
+            - "--name"
+            - "$(MESH_AGENT_NAME)"
             - "--verbose"
           resources:
             limits:
