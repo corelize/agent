@@ -13,7 +13,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rand::rngs::OsRng;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
