@@ -6,9 +6,8 @@ description = "Mesh VPN Agent - Infrastructure node for mesh network"
 authors = ["CloudShield Security"]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1.40", features = ["full"] }
-futures-util = "0.3"
+# Async runtime - only features actually used
+tokio = { version = "1.40", features = ["rt-multi-thread", "io-util", "net", "sync", "time", "macros"] }
 
 # QUIC transport
 quinn = "0.11"
@@ -31,26 +30,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
 anyhow = "1.0"
-thiserror = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 rand = "0.8"
-bytes = "1.7"
 
 # Crypto for Ed25519 keys
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 
-# Network
-socket2 = "0.5"
-
 # System
 dirs = "5.0"
 hostname = "0.4"
-
-# Platform-specific
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["net", "ioctl"] }
 
 [profile.release]
 lto = true
