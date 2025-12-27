@@ -242,6 +242,52 @@ struct RegisterResponse {
     relay_token: String,
 }
 
+/// Audit event types matching backend enum
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEventType {
+    ConnectionAllowed,
+    ConnectionBlocked,
+    PortBlocked,
+    ResourceAccessed,
+    ResourceDenied,
+}
+
+/// Audit status matching backend enum
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStatus {
+    Success,
+    Denied,
+    Warning,
+    Info,
+}
+
+/// Request to create an audit event
+#[derive(Debug, Serialize)]
+struct AuditEventRequest {
+    event_type: AuditEventType,
+    status: AuditStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_port: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(default)]
+    details: serde_json::Value,
+}
+
 // =============================================================================
 // Agent Implementation
 // =============================================================================
@@ -391,8 +437,23 @@ async fn register_with_control(
         .context("Failed to connect to control server")?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Registration failed: {}", body);
+
+        // Check for network_not_found error
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if json.get("error").and_then(|e| e.as_str()) == Some("network_not_found") {
+                let message = json.get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Network not found");
+                error!("FATAL: {}", message);
+                error!("Please check your NETWORK_ID environment variable or --network-id argument");
+                error!("Use --network <slug> to specify network by name, or verify the network exists in the control server");
+                std::process::exit(1);
+            }
+        }
+
+        anyhow::bail!("Registration failed ({}): {}", status, body);
     }
 
     let result: RegisterResponse = response.json().await?;
@@ -515,6 +576,51 @@ async fn send_keepalive(state: &Arc<RwLock<AgentState>>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Post an audit event to the control server (fire-and-forget)
+/// Used for connection logging (allowed, blocked, port denied)
+/// This is non-blocking - failures are logged but don't affect the main request
+async fn post_audit_event(
+    control_url: &str,
+    auth_key: Option<&str>,
+    _agent_id: Option<&str>,
+    event: AuditEventRequest,
+) {
+    let url = format!("{}/api/v1/audit/events", control_url.trim_end_matches('/'));
+
+    // Use a client with a short timeout to avoid blocking
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to create HTTP client for audit: {}", e);
+            return;
+        }
+    };
+
+    let mut req_builder = client.post(&url).json(&event);
+
+    // Add X-Agent-Key header for authentication
+    if let Some(key) = auth_key {
+        req_builder = req_builder.header("X-Agent-Key", key);
+    }
+
+    match req_builder.send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                debug!("Audit event posted: {:?}", event.event_type);
+            } else {
+                warn!("Audit event failed with status: {}", response.status());
+            }
+        }
+        Err(e) => {
+            // Log but don't fail - audit is best-effort
+            warn!("Audit event request failed: {}", e);
+        }
+    }
 }
 
 /// Fetch and update resources from control server
@@ -1034,8 +1140,9 @@ async fn run_relay_client(
                 match result {
                     Ok((send, recv)) => {
                         let state = state.clone();
+                        let remote_addr = connection.remote_address();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_quic_stream(send, recv, state).await {
+                            if let Err(e) = handle_quic_stream(send, recv, state, remote_addr).await {
                                 debug!("Relay stream error: {}", e);
                             }
                         });
@@ -1155,8 +1262,9 @@ async fn handle_quic_connection(
         match connection.accept_bi().await {
             Ok((send, recv)) => {
                 let state = state.clone();
+                let addr = remote_addr;
                 tokio::spawn(async move {
-                    if let Err(e) = handle_quic_stream(send, recv, state).await {
+                    if let Err(e) = handle_quic_stream(send, recv, state, addr).await {
                         debug!("QUIC stream error: {}", e);
                     }
                 });
@@ -1183,6 +1291,7 @@ async fn handle_quic_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     state: Arc<RwLock<AgentState>>,
+    remote_addr: SocketAddr,
 ) -> Result<()> {
     // Read header line (format: "PROXY:host:port\n" or "TUN:\n")
     let mut header_buf = Vec::with_capacity(256);
@@ -1207,23 +1316,36 @@ async fn handle_quic_stream(
     debug!("QUIC stream header: {}", header);
 
     if header.starts_with("PROXY:") {
-        // Format: "PROXY:host:port"
+        // Format: "PROXY:host:port:user_id" (user_id may be empty)
         let target = header.trim_start_matches("PROXY:");
-        let parts: Vec<&str> = target.rsplitn(2, ':').collect();
+        // Split from right: user_id, port, host (host may contain colons for IPv6)
+        let parts: Vec<&str> = target.rsplitn(3, ':').collect();
 
-        if parts.len() != 2 {
+        // Handle both old format (host:port) and new format (host:port:user_id)
+        let (host, port, user_id): (&str, u16, Option<String>) = if parts.len() == 3 {
+            // New format: [user_id, port, host]
+            let user_id_str = parts[0];
+            let port: u16 = parts[1].parse()
+                .context(format!("Invalid port in PROXY header: {}", parts[1]))?;
+            let host = parts[2];
+            let user_id = if user_id_str.is_empty() { None } else { Some(user_id_str.to_string()) };
+            (host, port, user_id)
+        } else if parts.len() == 2 {
+            // Old format: [port, host] - for backwards compatibility
+            let port: u16 = parts[0].parse()
+                .context(format!("Invalid port in PROXY header: {}", parts[0]))?;
+            let host = parts[1];
+            (host, port, None)
+        } else {
             anyhow::bail!("Invalid PROXY header format: {}", header);
-        }
+        };
 
-        let port: u16 = parts[0].parse()
-            .context(format!("Invalid port in PROXY header: {}", parts[0]))?;
-        let host = parts[1];
-
-        info!("PROXY request: {}:{}", host, port);
+        info!("PROXY request: {}:{} (user: {:?})", host, port, user_id);
 
         // Look up resource by hostname or mesh_ip to find actual backend (synced from network)
         // Port enforcement: if mesh_port is set (non-zero), only that port is allowed
-        let backend: Result<Option<(String, u16)>, String> = {
+        // Returns: Ok((target_host, target_port, resource_id)) or Err((message, resource_id, resource_name, allowed_port, target_host))
+        let backend: Result<Option<(String, u16, Option<String>)>, (String, Option<String>, Option<String>, Option<u16>, Option<String>)> = {
             let state = state.read().await;
 
             // Helper: determine effective target port
@@ -1250,12 +1372,19 @@ async fn handle_quic_stream(
                 if !port_allowed(resource, port) {
                     warn!("Port {} not allowed for resource '{}' (allowed port: {})",
                         port, resource.name, resource.mesh_port);
-                    Err(format!("Port {} not allowed for {}", port, host))
+                    // Return detailed error with resource info for audit logging
+                    Err((
+                        format!("Port {} not allowed for {} (allowed: {})", port, resource.name, resource.mesh_port),
+                        Some(resource.id.clone()),
+                        Some(resource.name.clone()),
+                        Some(resource.mesh_port),
+                        Some(resource.target_host.clone()),
+                    ))
                 } else {
                     let target_port = effective_port(resource, port);
                     info!("Found resource '{}' for hostname {} -> {}:{} (mesh_port: {}, target_port: {})",
                         resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
-                    Ok(Some((resource.target_host.clone(), target_port)))
+                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()))))
                 }
             }
             // Then try to find resource by mesh_ip and port
@@ -1265,7 +1394,7 @@ async fn handle_quic_stream(
                 let target_port = effective_port(resource, port);
                 info!("Found resource '{}' for {}:{} -> {}:{} (configured port: {})",
                     resource.name, host, port, resource.target_host, target_port, resource.target_port);
-                Ok(Some((resource.target_host.clone(), target_port)))
+                Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()))))
             }
             // Also try matching just mesh_ip with any port
             else if let Some(resource) = state.resources.values()
@@ -1275,12 +1404,19 @@ async fn handle_quic_stream(
                 if !port_allowed(resource, port) {
                     warn!("Port {} not allowed for resource '{}' at {} (allowed port: {})",
                         port, resource.name, host, resource.mesh_port);
-                    Err(format!("Port {} not allowed for {}", port, host))
+                    // Return detailed error with resource info for audit logging
+                    Err((
+                        format!("Port {} not allowed for {} (allowed: {})", port, resource.name, resource.mesh_port),
+                        Some(resource.id.clone()),
+                        Some(resource.name.clone()),
+                        Some(resource.mesh_port),
+                        Some(resource.target_host.clone()),
+                    ))
                 } else {
                     let target_port = effective_port(resource, port);
                     info!("Found resource '{}' by IP only for {} -> {}:{} (mesh_port: {}, target_port: {})",
                         resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
-                    Ok(Some((resource.target_host.clone(), target_port)))
+                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()))))
                 }
             }
             // For mesh IPs with no resource match, log warning
@@ -1293,20 +1429,81 @@ async fn handle_quic_stream(
             }
         };
 
-        // Handle port rejection
+        // Handle port rejection - post audit event for blocked ports
         let backend = match backend {
             Ok(b) => b,
-            Err(msg) => {
+            Err((msg, err_resource_id, err_resource_name, allowed_port, err_target_host)) => {
+                // Post audit event for port blocked with detailed info
+                let (control_url, auth_key, network_id) = {
+                    let state = state.read().await;
+                    (
+                        state.control_url.clone(),
+                        state.auth_key.clone(),
+                        state.network_id.clone(),
+                    )
+                };
+                let event = AuditEventRequest {
+                    event_type: AuditEventType::PortBlocked,
+                    status: AuditStatus::Denied,
+                    user_id: user_id.clone(),
+                    network_id,
+                    resource_id: err_resource_id,
+                    agent_id: None, // Agent identified via X-Agent-Key header
+                    source_ip: Some(remote_addr.ip().to_string()),
+                    target_host: err_target_host, // Use resource's target_host for proper frontend matching
+                    target_port: Some(port as i32),
+                    message: Some(msg.clone()),
+                    details: serde_json::json!({
+                        "requested_port": port,
+                        "allowed_port": allowed_port,
+                        "resource_name": err_resource_name,
+                    }),
+                };
+                tokio::spawn(async move {
+                    post_audit_event(&control_url, auth_key.as_deref(), None, event).await;
+                });
+
                 send.write_all(format!("ERROR:{}\n", msg).as_bytes()).await?;
                 send.finish().ok();
                 return Ok(());
             }
         };
 
-        let (backend_host, backend_port) = backend.unwrap_or_else(|| {
-            debug!("Using host:port from PROXY header directly: {}:{}", host, port);
-            (host.to_string(), port)
-        });
+        let (backend_host, backend_port, resource_id) = backend
+            .map(|(h, p, rid)| (h, p, rid))
+            .unwrap_or_else(|| {
+                debug!("Using host:port from PROXY header directly: {}:{}", host, port);
+                (host.to_string(), port, None)
+            });
+
+        // Post audit event for connection allowed
+        {
+            let (control_url, auth_key, network_id) = {
+                let state = state.read().await;
+                (
+                    state.control_url.clone(),
+                    state.auth_key.clone(),
+                    state.network_id.clone(),
+                )
+            };
+            let target_host_clone = backend_host.clone();
+            let event = AuditEventRequest {
+                event_type: AuditEventType::ConnectionAllowed,
+                status: AuditStatus::Success,
+                user_id,
+                network_id,
+                resource_id,
+                agent_id: None, // Agent identified via X-Agent-Key header
+                source_ip: Some(remote_addr.ip().to_string()),
+                target_host: Some(target_host_clone),
+                target_port: Some(backend_port as i32),
+                message: Some(format!("Proxying to {}:{}", backend_host, backend_port)),
+                details: serde_json::json!({}),
+            };
+            tokio::spawn(async move {
+                post_audit_event(&control_url, auth_key.as_deref(), None, event).await;
+            });
+        }
 
         info!("Proxying to backend: {}:{}", backend_host, backend_port);
         proxy_to_backend(send, recv, &backend_host, backend_port).await?;
