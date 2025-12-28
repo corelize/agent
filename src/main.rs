@@ -7,6 +7,9 @@
 //! - Agent accepts QUIC connections from VPN clients (direct or via relay)
 //! - Traffic flows through encrypted QUIC streams, NOT local TCP proxies
 //! - Stream types: "PROXY:host:port" for direct proxy, "TUN:" for IP packets
+//! - "SIGNAL:" streams for P2P ICE candidate exchange
+
+mod signaling;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -40,6 +43,190 @@ fn get_local_ip() -> Option<String> {
     socket.connect("8.8.8.8:80").ok()?;
     let local_addr = socket.local_addr().ok()?;
     Some(local_addr.ip().to_string())
+}
+
+/// STUN discovery result
+#[derive(Debug)]
+struct StunResult {
+    public_ip: String,
+    public_port: u16,
+    nat_type: signaling::NatType,
+    local_port: u16,
+}
+
+/// Discover public IP and NAT type using STUN
+/// Uses Google's STUN server (stun.l.google.com:19302)
+async fn discover_stun() -> Option<StunResult> {
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    // STUN servers to try
+    let stun_servers = [
+        "stun.l.google.com:19302",
+        "stun1.l.google.com:19302",
+        "stun.cloudflare.com:3478",
+    ];
+
+    // Bind a local UDP socket
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to bind UDP socket for STUN: {}", e);
+            return None;
+        }
+    };
+
+    // Set timeout for responses
+    socket.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    socket.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+
+    let local_port = socket.local_addr().ok()?.port();
+
+    for stun_server in &stun_servers {
+        // Resolve STUN server
+        let addr = match tokio::net::lookup_host(stun_server).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(a) => a,
+                None => continue,
+            },
+            Err(_) => continue,
+        };
+
+        // Build STUN Binding Request
+        // STUN header: 20 bytes
+        // - 2 bytes: Message Type (0x0001 = Binding Request)
+        // - 2 bytes: Message Length (0 for binding request)
+        // - 4 bytes: Magic Cookie (0x2112A442)
+        // - 12 bytes: Transaction ID (random)
+        let mut request = [0u8; 20];
+        request[0] = 0x00; // Message type: Binding Request
+        request[1] = 0x01;
+        request[2] = 0x00; // Message length: 0
+        request[3] = 0x00;
+        // Magic cookie
+        request[4] = 0x21;
+        request[5] = 0x12;
+        request[6] = 0xA4;
+        request[7] = 0x42;
+        // Transaction ID (random)
+        use rand::Rng;
+        rand::thread_rng().fill(&mut request[8..20]);
+
+        // Send request
+        if socket.send_to(&request, addr).is_err() {
+            continue;
+        }
+
+        // Receive response
+        let mut response = [0u8; 128];
+        let n = match socket.recv_from(&mut response) {
+            Ok((n, _)) => n,
+            Err(_) => continue,
+        };
+
+        if n < 20 {
+            continue;
+        }
+
+        // Verify response type (0x0101 = Binding Response)
+        if response[0] != 0x01 || response[1] != 0x01 {
+            continue;
+        }
+
+        // Parse attributes to find XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
+        let msg_len = ((response[2] as usize) << 8) | (response[3] as usize);
+        let mut offset = 20;
+
+        while offset + 4 <= 20 + msg_len && offset + 4 <= n {
+            let attr_type = ((response[offset] as u16) << 8) | (response[offset + 1] as u16);
+            let attr_len = ((response[offset + 2] as usize) << 8) | (response[offset + 3] as usize);
+            offset += 4;
+
+            if offset + attr_len > n {
+                break;
+            }
+
+            if attr_type == 0x0020 && attr_len >= 8 {
+                // XOR-MAPPED-ADDRESS
+                let family = response[offset + 1];
+                if family == 0x01 {
+                    // IPv4
+                    // XOR port with magic cookie upper 16 bits
+                    let xor_port = ((response[offset + 2] as u16) << 8) | (response[offset + 3] as u16);
+                    let port = xor_port ^ 0x2112;
+
+                    // XOR IP with magic cookie
+                    let xor_ip = [
+                        response[offset + 4] ^ 0x21,
+                        response[offset + 5] ^ 0x12,
+                        response[offset + 6] ^ 0xA4,
+                        response[offset + 7] ^ 0x42,
+                    ];
+                    let ip = format!("{}.{}.{}.{}", xor_ip[0], xor_ip[1], xor_ip[2], xor_ip[3]);
+
+                    // Determine NAT type (simplified - full detection requires multiple servers)
+                    // For now, assume if we get a response, we're behind some form of NAT
+                    let local_ip = get_local_ip().unwrap_or_default();
+                    let nat_type = if ip == local_ip {
+                        signaling::NatType::Open
+                    } else {
+                        // Could be any cone NAT, assume port restricted as conservative guess
+                        signaling::NatType::PortRestricted
+                    };
+
+                    info!("STUN discovery: public {}:{}, local port {}, NAT type {:?}",
+                          ip, port, local_port, nat_type);
+
+                    return Some(StunResult {
+                        public_ip: ip,
+                        public_port: port,
+                        nat_type,
+                        local_port,
+                    });
+                }
+            } else if attr_type == 0x0001 && attr_len >= 8 {
+                // MAPPED-ADDRESS (fallback for servers that don't support XOR)
+                let family = response[offset + 1];
+                if family == 0x01 {
+                    // IPv4
+                    let port = ((response[offset + 2] as u16) << 8) | (response[offset + 3] as u16);
+                    let ip = format!(
+                        "{}.{}.{}.{}",
+                        response[offset + 4],
+                        response[offset + 5],
+                        response[offset + 6],
+                        response[offset + 7]
+                    );
+
+                    let local_ip = get_local_ip().unwrap_or_default();
+                    let nat_type = if ip == local_ip {
+                        signaling::NatType::Open
+                    } else {
+                        signaling::NatType::PortRestricted
+                    };
+
+                    info!("STUN discovery (MAPPED-ADDRESS): public {}:{}, NAT type {:?}",
+                          ip, port, nat_type);
+
+                    return Some(StunResult {
+                        public_ip: ip,
+                        public_port: port,
+                        nat_type,
+                        local_port,
+                    });
+                }
+            }
+
+            offset += attr_len;
+            // Align to 4-byte boundary
+            if attr_len % 4 != 0 {
+                offset += 4 - (attr_len % 4);
+            }
+        }
+    }
+
+    warn!("STUN discovery failed - could not determine public IP");
+    None
 }
 
 // =============================================================================
@@ -211,6 +398,10 @@ pub struct AgentState {
     pub relay_token: Option<String>,
     /// Network ID for re-registration
     pub network_id: Option<String>,
+    /// ICE candidates for P2P signaling
+    pub ice_candidates: Vec<signaling::IceCandidate>,
+    /// NAT type detected via STUN
+    pub nat_type: signaling::NatType,
 }
 
 /// Registration request
@@ -377,6 +568,8 @@ impl AgentState {
             server_agent_id: None,
             relay_token: None,
             network_id: None,
+            ice_candidates: Vec::new(),
+            nat_type: signaling::NatType::Unknown,
         }
     }
 }
@@ -1126,6 +1319,57 @@ async fn run_relay_client(
     }
 
     info!("Authenticated with relay as agent: {}", agent_id);
+
+    // Send ICE_UPDATE with our candidates to relay for P2P signaling
+    {
+        let (candidates, nat_type) = {
+            let s = state.read().await;
+            (s.ice_candidates.clone(), s.nat_type.clone())
+        };
+
+        if !candidates.is_empty() {
+            let ice_update = signaling::IceUpdateMessage {
+                candidates,
+                nat_type,
+            };
+
+            // Open new stream for ICE_UPDATE
+            match connection.open_bi().await {
+                Ok((mut ice_send, mut ice_recv)) => {
+                    let ice_json = serde_json::to_string(&ice_update)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let ice_msg = format!("ICE_UPDATE\n{}\n", ice_json);
+
+                    if let Err(e) = ice_send.write_all(ice_msg.as_bytes()).await {
+                        warn!("Failed to send ICE_UPDATE: {}", e);
+                    } else if let Err(e) = ice_send.flush().await {
+                        warn!("Failed to flush ICE_UPDATE: {}", e);
+                    } else {
+                        // Wait for OK response
+                        let mut buf = [0u8; 32];
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            ice_recv.read(&mut buf)
+                        ).await {
+                            Ok(Ok(Some(_))) => {
+                                info!("ICE candidates registered with relay ({} candidates, NAT: {:?})",
+                                      ice_update.candidates.len(), ice_update.nat_type);
+                            }
+                            _ => {
+                                warn!("ICE_UPDATE acknowledgment failed");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to open ICE_UPDATE stream: {}", e);
+                }
+            }
+        } else {
+            info!("No ICE candidates available - skipping ICE_UPDATE");
+        }
+    }
+
     info!("Relay mode active - accepting forwarded streams from clients");
 
     // Accept forwarded streams from relay AND send periodic keepalives
@@ -1515,6 +1759,76 @@ async fn handle_quic_stream(
         send.finish().ok();
         return Ok(());
 
+    } else if header.starts_with("SIGNAL:") {
+        // ICE signaling from relay - client wants to establish P2P
+        // Format: "SIGNAL:client_session_id\n" followed by JSON IceOffer
+        let client_session_id = header.trim_start_matches("SIGNAL:").to_string();
+        debug!("ICE signaling request from client session: {}", client_session_id);
+
+        // Read the ICE offer JSON
+        let mut offer_buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match recv.read(&mut byte).await? {
+                Some(1) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    offer_buf.push(byte[0]);
+                    if offer_buf.len() > 8192 {
+                        anyhow::bail!("ICE offer too large");
+                    }
+                }
+                _ => anyhow::bail!("Connection closed before ICE offer"),
+            }
+        }
+
+        let offer: signaling::SignalMessage = serde_json::from_slice(&offer_buf)
+            .context("Failed to parse ICE offer")?;
+
+        // Handle the ICE offer
+        if let signaling::SignalMessage::IceOffer { client_session_id: _, candidates: client_candidates, nat_type: client_nat_type } = offer {
+            info!("Received ICE offer from client: {} candidates, NAT type {:?}",
+                  client_candidates.len(), client_nat_type);
+
+            // Get our ICE candidates from state
+            let (our_candidates, our_nat_type) = {
+                let state = state.read().await;
+                (state.ice_candidates.clone(), state.nat_type.clone())
+            };
+
+            // Check P2P viability
+            let p2p_possibility = signaling::can_p2p_connect(&client_nat_type, &our_nat_type);
+            info!("P2P possibility: {:?} (client NAT: {:?}, agent NAT: {:?})",
+                  p2p_possibility, client_nat_type, our_nat_type);
+
+            // Send ICE answer back to relay for forwarding to client
+            let answer = signaling::SignalMessage::IceAnswer {
+                client_session_id,
+                candidates: our_candidates,
+                nat_type: our_nat_type,
+            };
+
+            let answer_json = serde_json::to_string(&answer)?;
+            send.write_all(answer_json.as_bytes()).await?;
+            send.write_all(b"\n").await?;
+            send.finish().ok();
+
+            info!("Sent ICE answer to relay for forwarding to client");
+        } else {
+            warn!("Unexpected signal message type, expected IceOffer");
+            let error = signaling::SignalMessage::Error {
+                code: "invalid_message".to_string(),
+                message: "Expected IceOffer message".to_string(),
+            };
+            let error_json = serde_json::to_string(&error)?;
+            send.write_all(error_json.as_bytes()).await?;
+            send.write_all(b"\n").await?;
+            send.finish().ok();
+        }
+
+        return Ok(());
+
     } else if header.starts_with("TUN:") {
         // TUN packet mode - for future IP packet handling
         info!("TUN stream requested");
@@ -1679,6 +1993,53 @@ async fn main() -> Result<()> {
     info!("Agent registered successfully");
     info!("HTTP API: http://localhost:{}", args.port);
     info!("Architecture: Twingate-style (QUIC streams, resources synced from network)");
+
+    // Perform STUN discovery for P2P signaling
+    info!("Discovering public IP and NAT type via STUN...");
+    let quic_port = args.quic_port;
+    let local_ip = get_local_ip();
+
+    if let Some(stun_result) = discover_stun().await {
+        // Build ICE candidates from STUN result
+        let candidates = signaling::build_candidates(
+            Some(&stun_result.public_ip),
+            Some(stun_result.public_port),
+            local_ip.as_deref(),
+            Some(quic_port),
+        );
+
+        info!("ICE candidates discovered: {} (public {}:{}, local {:?}:{})",
+              candidates.len(),
+              stun_result.public_ip,
+              stun_result.public_port,
+              local_ip,
+              quic_port);
+
+        // Update state with ICE candidates
+        {
+            let mut s = state.write().await;
+            s.ice_candidates = candidates;
+            s.nat_type = stun_result.nat_type;
+        }
+    } else {
+        // Fallback to just local IP if STUN fails
+        if let Some(ref ip) = local_ip {
+            let candidates = signaling::build_candidates(
+                None,
+                None,
+                Some(ip),
+                Some(quic_port),
+            );
+
+            info!("STUN failed - using local candidates only: {:?}:{}", ip, quic_port);
+
+            let mut s = state.write().await;
+            s.ice_candidates = candidates;
+            s.nat_type = signaling::NatType::Unknown;
+        } else {
+            warn!("No ICE candidates available - P2P signaling will be limited");
+        }
+    }
 
     // Start background tasks
     let state_clone = state.clone();
