@@ -3,7 +3,7 @@
 //! This agent registers with a control server, receives mesh IP assignments,
 //! and proxies traffic from VPN clients to backend services through QUIC tunnels.
 //!
-//! Architecture (Twingate-style):
+//! Architecture:
 //! - Agent accepts QUIC connections from VPN clients (direct or via relay)
 //! - Traffic flows through encrypted QUIC streams, NOT local TCP proxies
 //! - Stream types: "PROXY:host:port" for direct proxy, "TUN:" for IP packets
@@ -1061,7 +1061,6 @@ fn create_relay_client_config() -> Result<ClientConfig> {
 }
 
 /// Connect to relay server and handle forwarded streams
-/// This is the Twingate-style relay mode where agent connects OUTBOUND
 async fn run_relay_client(
     state: Arc<RwLock<AgentState>>,
     relay_addr: SocketAddr,
@@ -1284,7 +1283,7 @@ async fn handle_quic_connection(
 }
 
 /// Handle a single QUIC bidirectional stream
-/// Twingate-style protocol:
+/// protocol:
 ///   - "PROXY:host:port\n" → TCP proxy to host:port
 ///   - "TUN:\n" → IP packet tunneling (parse IP headers)
 async fn handle_quic_stream(
@@ -1678,7 +1677,6 @@ async fn main() -> Result<()> {
 
     info!("Agent registered successfully");
     info!("HTTP API: http://localhost:{}", args.port);
-    info!("Architecture: Twingate-style (QUIC streams, resources synced from network)");
 
     // Start background tasks
     let state_clone = state.clone();
