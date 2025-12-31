@@ -530,9 +530,9 @@ async fn resolve_network_slug(server_url: &str, slug: &str, auth_key: Option<&st
 
 /// Send heartbeat to control server
 async fn send_keepalive(state: &Arc<RwLock<AgentState>>) -> Result<()> {
-    let (url, auth_key, version) = {
+    let (url, auth_key, version, agent_id) = {
         let state = state.read().await;
-        // Use the server-assigned agent_id for the heartbeat endpoint
+        // Use the server-assigned agent_id for the heartbeat body
         let server_agent_id = match &state.server_agent_id {
             Some(id) => id.clone(),
             None => {
@@ -541,15 +541,15 @@ async fn send_keepalive(state: &Arc<RwLock<AgentState>>) -> Result<()> {
             }
         };
         let url = format!(
-            "{}/api/v1/agents/{}/heartbeat",
-            state.control_url.trim_end_matches('/'),
-            server_agent_id
+            "{}/api/v1/agents/heartbeat",
+            state.control_url.trim_end_matches('/')
         );
-        (url, state.auth_key.clone(), env!("CARGO_PKG_VERSION").to_string())
+        (url, state.auth_key.clone(), env!("CARGO_PKG_VERSION").to_string(), server_agent_id)
     };
 
     // Body matches AgentHeartbeatRequest structure expected by backend
     let body = serde_json::json!({
+        "agent_id": agent_id,
         "status": "online",
         "version": version,
     });
