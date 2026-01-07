@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
@@ -99,6 +100,20 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Enable K8s API proxy for authenticated kubectl access
+    /// When enabled, agent listens for K8s API requests and injects JWT auth
+    #[arg(long, env = "MESH_K8S_PROXY_ENABLED")]
+    k8s_proxy_enabled: bool,
+
+    /// K8s proxy listen port (default: 6443)
+    #[arg(long, env = "MESH_K8S_PROXY_PORT", default_value = "6443")]
+    k8s_proxy_port: u16,
+
+    /// K8s gateway URL to forward authenticated requests to
+    /// (e.g., https://k8s-gateway.example.com)
+    #[arg(long, env = "MESH_K8S_GATEWAY_URL")]
+    k8s_gateway_url: Option<String>,
 }
 
 // =============================================================================
@@ -198,6 +213,47 @@ pub struct AgentConfig {
     pub registered_at: Option<DateTime<Utc>>,
 }
 
+/// VPN session - tracks authenticated user sessions from VPN clients
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnSession {
+    /// User email from authentication
+    pub user_email: String,
+    /// User ID (may be same as email or UUID)
+    pub user_id: String,
+    /// Client IP address (from QUIC connection)
+    pub client_ip: String,
+    /// When the session was established
+    pub connected_at: DateTime<Utc>,
+    /// Last activity timestamp
+    pub last_activity: DateTime<Utc>,
+    /// Session ID for tracking
+    pub session_id: String,
+}
+
+impl VpnSession {
+    fn new(user_id: String, client_ip: String) -> Self {
+        let now = Utc::now();
+        // Extract email from user_id if it looks like an email, otherwise use as-is
+        let user_email = if user_id.contains('@') {
+            user_id.clone()
+        } else {
+            format!("{}@unknown", user_id)
+        };
+        Self {
+            user_email,
+            user_id,
+            client_ip,
+            connected_at: now,
+            last_activity: now,
+            session_id: Uuid::new_v4().to_string(),
+        }
+    }
+
+    fn touch(&mut self) {
+        self.last_activity = Utc::now();
+    }
+}
+
 /// Agent state
 pub struct AgentState {
     pub config: AgentConfig,
@@ -211,6 +267,8 @@ pub struct AgentState {
     pub relay_token: Option<String>,
     /// Network ID for re-registration
     pub network_id: Option<String>,
+    /// VPN sessions - maps client IP to session info
+    pub vpn_sessions: HashMap<String, VpnSession>,
 }
 
 /// Registration request
@@ -286,6 +344,393 @@ struct AuditEventRequest {
     message: Option<String>,
     #[serde(default)]
     details: serde_json::Value,
+}
+
+// =============================================================================
+// Session Recording Types
+// =============================================================================
+
+/// Generate a recording ID with rec_ prefix (matches backend format)
+fn new_recording_id() -> String {
+    const ALPHABET: [char; 36] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+        'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+        'u', 'v', 'w', 'x', 'y', 'z',
+    ];
+    // Generate 16 random characters
+    let mut id = String::with_capacity(16);
+    for _ in 0..16 {
+        let idx = rand::random::<usize>() % ALPHABET.len();
+        id.push(ALPHABET[idx]);
+    }
+    format!("rec_{}", id)
+}
+
+/// Determine resource type from resource protocol or hostname
+fn determine_resource_type(resource: &Resource) -> &'static str {
+    let protocol = resource.protocol.to_lowercase();
+    let hostname = resource.hostname.to_lowercase();
+    let target = resource.target_host.to_lowercase();
+
+    // Check protocol first
+    if protocol == "postgresql" || protocol == "postgres" {
+        return "postgresql";
+    }
+    if protocol == "mysql" {
+        return "mysql";
+    }
+    if protocol == "ssh" {
+        return "ssh";
+    }
+    if protocol == "http" || protocol == "https" {
+        return "http";
+    }
+
+    // Infer from hostname patterns
+    if hostname.contains("postgres") || hostname.contains("pg") || hostname.starts_with("db.") {
+        return "postgresql";
+    }
+    if hostname.contains("mysql") || hostname.contains("maria") {
+        return "mysql";
+    }
+
+    // Infer from target host
+    if target.contains("postgres") {
+        return "postgresql";
+    }
+    if target.contains("mysql") || target.contains("maria") {
+        return "mysql";
+    }
+
+    // Infer from port
+    match resource.target_port {
+        5432 => "postgresql",
+        3306 => "mysql",
+        22 => "ssh",
+        80 | 443 | 8080 | 8443 => "http",
+        _ => "tcp",
+    }
+}
+
+/// Check if a resource type should be recorded
+fn should_record(resource_type: &str) -> bool {
+    matches!(resource_type, "postgresql" | "mysql" | "ssh")
+}
+
+/// Direction of traffic flow
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    C2s, // Client to server
+    S2c, // Server to client
+}
+
+impl Direction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Direction::C2s => "c2s",
+            Direction::S2c => "s2c",
+        }
+    }
+}
+
+/// A single recorded event
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingEvent {
+    pub timestamp_ms: i64,
+    pub direction: String,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected_rows: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Serialize Vec<u8> as base64
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Serializer, Serialize};
+
+    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        STANDARD.encode(bytes).serialize(serializer)
+    }
+}
+
+/// Session recording state (held during proxy connection)
+#[derive(Debug)]
+pub struct SessionRecording {
+    pub id: String,
+    pub resource_id: String,
+    pub resource_type: String,
+    pub resource_name: String,
+    pub target_host: String,
+    pub target_port: u16,
+    pub user_id: Option<String>,
+    pub client_ip: String,
+    pub started_at: Instant,
+    pub events: Vec<RecordingEvent>,
+    pub total_bytes_client: i64,
+    pub total_bytes_server: i64,
+}
+
+impl SessionRecording {
+    fn new(
+        resource: &Resource,
+        resource_type: &str,
+        user_id: Option<String>,
+        client_ip: String,
+    ) -> Self {
+        Self {
+            id: new_recording_id(),
+            resource_id: resource.id.clone(),
+            resource_type: resource_type.to_string(),
+            resource_name: resource.name.clone(),
+            target_host: resource.target_host.clone(),
+            target_port: resource.target_port,
+            user_id,
+            client_ip,
+            started_at: Instant::now(),
+            events: Vec::new(),
+            total_bytes_client: 0,
+            total_bytes_server: 0,
+        }
+    }
+
+    fn add_event(&mut self, direction: Direction, data: Vec<u8>) {
+        let timestamp_ms = self.started_at.elapsed().as_millis() as i64;
+        let data_len = data.len() as i64;
+
+        match direction {
+            Direction::C2s => self.total_bytes_client += data_len,
+            Direction::S2c => self.total_bytes_server += data_len,
+        }
+
+        // Try to parse PostgreSQL protocol for query extraction
+        let (data_text, data_type, query_type) = if self.resource_type == "postgresql" {
+            parse_postgresql_message(&data, &direction)
+        } else {
+            (None, None, None)
+        };
+
+        self.events.push(RecordingEvent {
+            timestamp_ms,
+            direction: direction.as_str().to_string(),
+            data,
+            data_text,
+            data_type,
+            query_type,
+            affected_rows: None,
+            error_code: None,
+            error_message: None,
+            metadata: None,
+        });
+    }
+}
+
+/// Parse PostgreSQL wire protocol messages for query extraction
+fn parse_postgresql_message(
+    data: &[u8],
+    direction: &Direction,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if data.is_empty() {
+        return (None, None, None);
+    }
+
+    // PostgreSQL message format: 1 byte type + 4 bytes length + payload
+    // For client messages (c2s):
+    //   'Q' = Simple Query
+    //   'P' = Parse (prepared statement)
+    //   'E' = Execute
+    // For server messages (s2c):
+    //   'C' = CommandComplete
+    //   'E' = ErrorResponse
+    //   'T' = RowDescription
+    //   'D' = DataRow
+
+    let msg_type = data[0] as char;
+
+    match direction {
+        Direction::C2s => {
+            match msg_type {
+                'Q' => {
+                    // Simple Query: Q + len(4) + query_string + \0
+                    if data.len() > 5 {
+                        let query_bytes = &data[5..];
+                        if let Some(end) = query_bytes.iter().position(|&b| b == 0) {
+                            if let Ok(query) = std::str::from_utf8(&query_bytes[..end]) {
+                                let query_type = extract_query_type(query);
+                                return (
+                                    Some(query.to_string()),
+                                    Some("query".to_string()),
+                                    query_type,
+                                );
+                            }
+                        }
+                    }
+                    (None, Some("query".to_string()), None)
+                }
+                'P' => {
+                    // Parse (prepared statement): P + len(4) + name + \0 + query + \0 + ...
+                    if data.len() > 5 {
+                        let payload = &data[5..];
+                        // Skip statement name
+                        if let Some(name_end) = payload.iter().position(|&b| b == 0) {
+                            let query_start = name_end + 1;
+                            if query_start < payload.len() {
+                                let query_bytes = &payload[query_start..];
+                                if let Some(end) = query_bytes.iter().position(|&b| b == 0) {
+                                    if let Ok(query) = std::str::from_utf8(&query_bytes[..end]) {
+                                        let query_type = extract_query_type(query);
+                                        return (
+                                            Some(query.to_string()),
+                                            Some("query".to_string()),
+                                            query_type,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (None, Some("query".to_string()), None)
+                }
+                _ => (None, Some("raw".to_string()), None),
+            }
+        }
+        Direction::S2c => {
+            match msg_type {
+                'C' => {
+                    // CommandComplete: C + len(4) + tag + \0
+                    if data.len() > 5 {
+                        let tag_bytes = &data[5..];
+                        if let Some(end) = tag_bytes.iter().position(|&b| b == 0) {
+                            if let Ok(tag) = std::str::from_utf8(&tag_bytes[..end]) {
+                                return (
+                                    Some(tag.to_string()),
+                                    Some("response".to_string()),
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                    (None, Some("response".to_string()), None)
+                }
+                'E' => {
+                    // ErrorResponse: E + len(4) + fields
+                    // Each field: type(1) + value + \0, terminated by \0
+                    if data.len() > 5 {
+                        let mut error_msg = String::new();
+                        let mut pos = 5;
+                        while pos < data.len() && data[pos] != 0 {
+                            let field_type = data[pos] as char;
+                            pos += 1;
+                            if let Some(end) = data[pos..].iter().position(|&b| b == 0) {
+                                if let Ok(value) = std::str::from_utf8(&data[pos..pos + end]) {
+                                    if field_type == 'M' {
+                                        // Message
+                                        error_msg = value.to_string();
+                                    }
+                                }
+                                pos += end + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        return (
+                            Some(error_msg),
+                            Some("error".to_string()),
+                            None,
+                        );
+                    }
+                    (None, Some("error".to_string()), None)
+                }
+                _ => (None, Some("raw".to_string()), None),
+            }
+        }
+    }
+}
+
+/// Extract query type from SQL query string
+fn extract_query_type(query: &str) -> Option<String> {
+    let query = query.trim().to_uppercase();
+    if query.starts_with("SELECT") {
+        Some("SELECT".to_string())
+    } else if query.starts_with("INSERT") {
+        Some("INSERT".to_string())
+    } else if query.starts_with("UPDATE") {
+        Some("UPDATE".to_string())
+    } else if query.starts_with("DELETE") {
+        Some("DELETE".to_string())
+    } else if query.starts_with("CREATE") {
+        Some("CREATE".to_string())
+    } else if query.starts_with("DROP") {
+        Some("DROP".to_string())
+    } else if query.starts_with("ALTER") {
+        Some("ALTER".to_string())
+    } else if query.starts_with("BEGIN") || query.starts_with("START") {
+        Some("BEGIN".to_string())
+    } else if query.starts_with("COMMIT") {
+        Some("COMMIT".to_string())
+    } else if query.starts_with("ROLLBACK") {
+        Some("ROLLBACK".to_string())
+    } else {
+        None
+    }
+}
+
+/// Request to create a recording on the backend
+#[derive(Debug, Serialize)]
+struct CreateRecordingRequest {
+    resource_id: String,
+    resource_type: String,
+    resource_name: String,
+    target_host: String,
+    target_port: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_agent: Option<String>,
+}
+
+/// Response from creating a recording
+#[derive(Debug, Deserialize)]
+struct CreateRecordingResponse {
+    id: String,
+    status: String,
+    #[serde(default)]
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Request to add events to a recording
+#[derive(Debug, Serialize)]
+struct AddEventsRequest {
+    events: Vec<RecordingEvent>,
+}
+
+/// Request to complete a recording
+#[derive(Debug, Serialize)]
+struct CompleteRecordingRequest {
+    status: Option<String>,
 }
 
 // =============================================================================
@@ -377,7 +822,45 @@ impl AgentState {
             server_agent_id: None,
             relay_token: None,
             network_id: None,
+            vpn_sessions: HashMap::new(),
         }
+    }
+
+    /// Register or update a VPN session for a client
+    pub fn register_session(&mut self, user_id: String, client_ip: String) -> VpnSession {
+        let session = VpnSession::new(user_id, client_ip.clone());
+        info!("Registered VPN session: {} -> {} (session: {})",
+            session.user_email, client_ip, session.session_id);
+        self.vpn_sessions.insert(client_ip, session.clone());
+        session
+    }
+
+    /// Get session by client IP
+    pub fn get_session_by_ip(&self, client_ip: &str) -> Option<&VpnSession> {
+        self.vpn_sessions.get(client_ip)
+    }
+
+    /// Update session activity timestamp
+    pub fn touch_session(&mut self, client_ip: &str) {
+        if let Some(session) = self.vpn_sessions.get_mut(client_ip) {
+            session.touch();
+        }
+    }
+
+    /// Remove session by client IP
+    pub fn remove_session(&mut self, client_ip: &str) -> Option<VpnSession> {
+        if let Some(session) = self.vpn_sessions.remove(client_ip) {
+            info!("Removed VPN session: {} -> {} (session: {})",
+                session.user_email, client_ip, session.session_id);
+            Some(session)
+        } else {
+            None
+        }
+    }
+
+    /// Get all active sessions
+    pub fn list_sessions(&self) -> Vec<&VpnSession> {
+        self.vpn_sessions.values().collect()
     }
 }
 
@@ -623,6 +1106,143 @@ async fn post_audit_event(
     }
 }
 
+/// Upload a completed session recording to the backend (batch upload)
+/// Called when a proxy connection closes
+async fn upload_recording(
+    control_url: &str,
+    auth_key: Option<&str>,
+    network_id: Option<&str>,
+    agent_id: Option<&str>,
+    user_id: Option<&str>,
+    recording: SessionRecording,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to create HTTP client for recording upload: {}", e);
+            return;
+        }
+    };
+
+    // Step 1: Create the recording
+    let create_url = format!("{}/api/v1/recordings", control_url.trim_end_matches('/'));
+    let create_req = CreateRecordingRequest {
+        resource_id: recording.resource_id.clone(),
+        resource_type: recording.resource_type.clone(),
+        resource_name: recording.resource_name.clone(),
+        target_host: recording.target_host.clone(),
+        target_port: recording.target_port as i32,
+        network_id: network_id.map(|s| s.to_string()),
+        agent_id: agent_id.map(|s| s.to_string()),
+        device_id: None,
+        client_ip: Some(recording.client_ip.clone()),
+        user_agent: Some("mesh-agent".to_string()),
+    };
+
+    let mut req_builder = client.post(&create_url).json(&create_req);
+    if let Some(key) = auth_key {
+        req_builder = req_builder.header("X-Agent-Key", key);
+    }
+    if let Some(uid) = user_id {
+        req_builder = req_builder.header("X-User-Id", uid);
+    }
+
+    let recording_id = match req_builder.send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.json::<CreateRecordingResponse>().await {
+                    Ok(resp) => {
+                        info!("Created recording {} for resource {}", resp.id, recording.resource_name);
+                        resp.id
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse create recording response: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!("Failed to create recording ({}): {}", status, body);
+                return;
+            }
+        }
+        Err(e) => {
+            warn!("Failed to create recording: {}", e);
+            return;
+        }
+    };
+
+    // Step 2: Add events (in batches if there are many)
+    if !recording.events.is_empty() {
+        let events_url = format!("{}/api/v1/recordings/{}/events", control_url.trim_end_matches('/'), recording_id);
+
+        // Batch events in chunks of 100 to avoid oversized requests
+        for chunk in recording.events.chunks(100) {
+            let events_req = AddEventsRequest {
+                events: chunk.to_vec(),
+            };
+
+            let mut req_builder = client.post(&events_url).json(&events_req);
+            if let Some(key) = auth_key {
+                req_builder = req_builder.header("X-Agent-Key", key);
+            }
+
+            match req_builder.send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        warn!("Failed to add recording events ({}): {}", status, body);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to add recording events: {}", e);
+                }
+            }
+        }
+
+        debug!("Uploaded {} events for recording {}", recording.events.len(), recording_id);
+    }
+
+    // Step 3: Complete the recording
+    let complete_url = format!("{}/api/v1/recordings/{}/complete", control_url.trim_end_matches('/'), recording_id);
+    let complete_req = CompleteRecordingRequest {
+        status: Some("completed".to_string()),
+    };
+
+    let mut req_builder = client.post(&complete_url).json(&complete_req);
+    if let Some(key) = auth_key {
+        req_builder = req_builder.header("X-Agent-Key", key);
+    }
+
+    match req_builder.send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                let duration_ms = recording.started_at.elapsed().as_millis();
+                info!(
+                    "Completed recording {} ({} events, {} c2s bytes, {} s2c bytes, {}ms)",
+                    recording_id,
+                    recording.events.len(),
+                    recording.total_bytes_client,
+                    recording.total_bytes_server,
+                    duration_ms
+                );
+            } else {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                warn!("Failed to complete recording ({}): {}", status, body);
+            }
+        }
+        Err(e) => {
+            warn!("Failed to complete recording: {}", e);
+        }
+    }
+}
+
 /// Fetch and update resources from control server
 /// Resources are used for routing QUIC streams - no local TCP proxies needed
 async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
@@ -725,7 +1345,100 @@ async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
 
 /// Proxy data between QUIC stream and backend TCP connection
 /// Called when a QUIC stream requests "PROXY:host:port"
+/// Optionally records traffic if recording is provided
 async fn proxy_to_backend(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    target_host: &str,
+    target_port: u16,
+    recording: Option<&mut SessionRecording>,
+) -> Result<()> {
+    let target_addr = format!("{}:{}", target_host, target_port);
+    let mut backend = TcpStream::connect(&target_addr).await
+        .context(format!("Failed to connect to backend: {}", target_addr))?;
+
+    if recording.is_some() {
+        info!("QUIC → TCP proxy established (RECORDING): {}", target_addr);
+    } else {
+        info!("QUIC → TCP proxy established: {}", target_addr);
+    }
+
+    let (mut backend_read, mut backend_write) = backend.split();
+
+    // Use channels to collect recorded data
+    let (c2s_tx, mut c2s_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (s2c_tx, mut s2c_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+
+    let is_recording = recording.is_some();
+
+    // QUIC recv → TCP backend (with optional recording)
+    let quic_to_tcp = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match recv.read(&mut buf).await? {
+                Some(n) if n > 0 => {
+                    if is_recording {
+                        // Send copy to recording channel
+                        let _ = c2s_tx.send(buf[..n].to_vec()).await;
+                    }
+                    backend_write.write_all(&buf[..n]).await?;
+                }
+                _ => break,
+            }
+        }
+        drop(c2s_tx); // Close channel when done
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // TCP backend → QUIC send (with optional recording)
+    let tcp_to_quic = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = backend_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            if is_recording {
+                // Send copy to recording channel
+                let _ = s2c_tx.send(buf[..n].to_vec()).await;
+            }
+            send.write_all(&buf[..n]).await?;
+        }
+        drop(s2c_tx); // Close channel when done
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // Collect recorded events from channels
+    let record_collector = async {
+        if let Some(rec) = recording {
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(data) = c2s_rx.recv() => {
+                        rec.add_event(Direction::C2s, data);
+                    }
+                    Some(data) = s2c_rx.recv() => {
+                        rec.add_event(Direction::S2c, data);
+                    }
+                    else => break,
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // Run all three tasks concurrently
+    tokio::select! {
+        r = quic_to_tcp => { r?; }
+        r = tcp_to_quic => { r?; }
+        r = record_collector => { r?; }
+    }
+
+    Ok(())
+}
+
+/// Proxy without recording (simpler version for non-recordable resources)
+async fn proxy_to_backend_simple(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     target_host: &str,
@@ -1316,9 +2029,21 @@ async fn handle_quic_stream(
 
     if header.starts_with("PROXY:") {
         // Format: "PROXY:host:port:user_id" (user_id may be empty)
+        // Or with relay-forwarded mesh_ip: "PROXY:host:port:user_id::mesh_ip"
+        // The "::" delimiter separates the proxy part from the forwarded mesh IP
         let target = header.trim_start_matches("PROXY:");
+
+        // Check if relay forwarded client's mesh IP (indicated by "::" delimiter)
+        let (proxy_part, forwarded_mesh_ip) = if let Some(delimiter_pos) = target.find("::") {
+            let (proxy, mesh_ip_part) = target.split_at(delimiter_pos);
+            let mesh_ip = mesh_ip_part.trim_start_matches("::");
+            (proxy, if mesh_ip.is_empty() { None } else { Some(mesh_ip.to_string()) })
+        } else {
+            (target, None)
+        };
+
         // Split from right: user_id, port, host (host may contain colons for IPv6)
-        let parts: Vec<&str> = target.rsplitn(3, ':').collect();
+        let parts: Vec<&str> = proxy_part.rsplitn(3, ':').collect();
 
         // Handle both old format (host:port) and new format (host:port:user_id)
         let (host, port, user_id): (&str, u16, Option<String>) = if parts.len() == 3 {
@@ -1339,12 +2064,30 @@ async fn handle_quic_stream(
             anyhow::bail!("Invalid PROXY header format: {}", header);
         };
 
-        info!("PROXY request: {}:{} (user: {:?})", host, port, user_id);
+        // Determine effective client IP for audit logging:
+        // - Use forwarded mesh_ip if provided by relay (client's actual mesh IP)
+        // - Otherwise fall back to remote_addr (direct connection or relay's IP)
+        let effective_client_ip = forwarded_mesh_ip.as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| "");
+        let effective_client_ip = if effective_client_ip.is_empty() {
+            remote_addr.ip().to_string()
+        } else {
+            effective_client_ip.to_string()
+        };
+
+        info!("PROXY request: {}:{} (user: {:?}, client_ip: {})", host, port, user_id, effective_client_ip);
+
+        // Register/update VPN session if user_id is provided
+        if let Some(ref uid) = user_id {
+            let mut state = state.write().await;
+            state.register_session(uid.clone(), effective_client_ip.clone());
+        }
 
         // Look up resource by hostname or mesh_ip to find actual backend (synced from network)
         // Port enforcement: if mesh_port is set (non-zero), only that port is allowed
-        // Returns: Ok((target_host, target_port, resource_id)) or Err((message, resource_id, resource_name, allowed_port, target_host))
-        let backend: Result<Option<(String, u16, Option<String>)>, (String, Option<String>, Option<String>, Option<u16>, Option<String>)> = {
+        // Returns: Ok((target_host, target_port, resource_id, Option<Resource>)) or Err((message, resource_id, resource_name, allowed_port, target_host))
+        let backend: Result<Option<(String, u16, Option<String>, Option<Resource>)>, (String, Option<String>, Option<String>, Option<u16>, Option<String>)> = {
             let state = state.read().await;
 
             // Helper: determine effective target port
@@ -1383,7 +2126,7 @@ async fn handle_quic_stream(
                     let target_port = effective_port(resource, port);
                     info!("Found resource '{}' for hostname {} -> {}:{} (mesh_port: {}, target_port: {})",
                         resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
-                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()))))
+                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()), Some(resource.clone()))))
                 }
             }
             // Then try to find resource by mesh_ip and port
@@ -1393,7 +2136,7 @@ async fn handle_quic_stream(
                 let target_port = effective_port(resource, port);
                 info!("Found resource '{}' for {}:{} -> {}:{} (configured port: {})",
                     resource.name, host, port, resource.target_host, target_port, resource.target_port);
-                Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()))))
+                Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()), Some(resource.clone()))))
             }
             // Also try matching just mesh_ip with any port
             else if let Some(resource) = state.resources.values()
@@ -1415,7 +2158,7 @@ async fn handle_quic_stream(
                     let target_port = effective_port(resource, port);
                     info!("Found resource '{}' by IP only for {} -> {}:{} (mesh_port: {}, target_port: {})",
                         resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
-                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()))))
+                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()), Some(resource.clone()))))
                 }
             }
             // For mesh IPs with no resource match, log warning
@@ -1448,7 +2191,7 @@ async fn handle_quic_stream(
                     network_id,
                     resource_id: err_resource_id,
                     agent_id: None, // Agent identified via X-Agent-Key header
-                    source_ip: Some(remote_addr.ip().to_string()),
+                    source_ip: Some(effective_client_ip.clone()),
                     target_host: err_target_host, // Use resource's target_host for proper frontend matching
                     target_port: Some(port as i32),
                     message: Some(msg.clone()),
@@ -1468,44 +2211,100 @@ async fn handle_quic_stream(
             }
         };
 
-        let (backend_host, backend_port, resource_id) = backend
-            .map(|(h, p, rid)| (h, p, rid))
+        let (backend_host, backend_port, resource_id, resource) = backend
+            .map(|(h, p, rid, res)| (h, p, rid, res))
             .unwrap_or_else(|| {
                 debug!("Using host:port from PROXY header directly: {}:{}", host, port);
-                (host.to_string(), port, None)
+                (host.to_string(), port, None, None)
             });
+
+        // Determine if we should record this session
+        let resource_type = resource.as_ref().map(|r| determine_resource_type(r));
+        let should_record_session = resource_type.as_ref().map(|t| should_record(t)).unwrap_or(false);
+
+        // Capture state info for recording before dropping the lock
+        let (control_url, auth_key, network_id, agent_id) = {
+            let state = state.read().await;
+            (
+                state.control_url.clone(),
+                state.auth_key.clone(),
+                state.network_id.clone(),
+                state.server_agent_id.clone(),
+            )
+        };
 
         // Post audit event for connection allowed
         {
-            let (control_url, auth_key, network_id) = {
-                let state = state.read().await;
-                (
-                    state.control_url.clone(),
-                    state.auth_key.clone(),
-                    state.network_id.clone(),
-                )
-            };
             let target_host_clone = backend_host.clone();
+            let ctrl_url = control_url.clone();
+            let auth = auth_key.clone();
+            let net_id = network_id.clone();
+            let user_id_clone = user_id.clone();
+            let res_id = resource_id.clone();
             let event = AuditEventRequest {
                 event_type: AuditEventType::ConnectionAllowed,
                 status: AuditStatus::Success,
-                user_id,
-                network_id,
-                resource_id,
+                user_id: user_id_clone,
+                network_id: net_id,
+                resource_id: res_id,
                 agent_id: None, // Agent identified via X-Agent-Key header
-                source_ip: Some(remote_addr.ip().to_string()),
+                source_ip: Some(effective_client_ip.clone()),
                 target_host: Some(target_host_clone),
                 target_port: Some(backend_port as i32),
                 message: Some(format!("Proxying to {}:{}", backend_host, backend_port)),
                 details: serde_json::json!({}),
             };
             tokio::spawn(async move {
-                post_audit_event(&control_url, auth_key.as_deref(), None, event).await;
+                post_audit_event(&ctrl_url, auth.as_deref(), None, event).await;
             });
         }
 
-        info!("Proxying to backend: {}:{}", backend_host, backend_port);
-        proxy_to_backend(send, recv, &backend_host, backend_port).await?;
+        // Proxy with optional session recording
+        if should_record_session {
+            if let (Some(res), Some(res_type)) = (resource.as_ref(), resource_type.as_ref()) {
+                info!("Proxying to backend (RECORDING {}): {}:{}", res_type, backend_host, backend_port);
+
+                // Create session recording
+                let mut recording = SessionRecording::new(
+                    res,
+                    res_type,
+                    user_id.clone(),
+                    effective_client_ip.clone(),
+                );
+                let recording_id = recording.id.clone();
+                info!("Started session recording {} for {} ({})", recording_id, res.name, res_type);
+
+                // Run proxy with recording
+                let proxy_result = proxy_to_backend(send, recv, &backend_host, backend_port, Some(&mut recording)).await;
+
+                // Upload recording (async, fire-and-forget)
+                let ctrl_url = control_url.clone();
+                let auth = auth_key.clone();
+                let net_id = network_id.clone();
+                let agent = agent_id.clone();
+                let uid = user_id.clone();
+                tokio::spawn(async move {
+                    upload_recording(
+                        &ctrl_url,
+                        auth.as_deref(),
+                        net_id.as_deref(),
+                        agent.as_deref(),
+                        uid.as_deref(),
+                        recording,
+                    ).await;
+                });
+
+                proxy_result?;
+            } else {
+                // Fallback to simple proxy if resource info is missing
+                info!("Proxying to backend: {}:{}", backend_host, backend_port);
+                proxy_to_backend_simple(send, recv, &backend_host, backend_port).await?;
+            }
+        } else {
+            // Non-recordable resource - use simple proxy
+            info!("Proxying to backend: {}:{}", backend_host, backend_port);
+            proxy_to_backend_simple(send, recv, &backend_host, backend_port).await?;
+        }
 
     } else if header.starts_with("HEALTH:") {
         // Health check from VPN client - respond with OK
@@ -1538,7 +2337,7 @@ async fn handle_quic_stream(
 
         if let Some((host, port)) = target {
             info!("Legacy QUIC request → {}:{}", host, port);
-            proxy_to_backend(send, recv, &host, port).await?;
+            proxy_to_backend(send, recv, &host, port, None).await?;
         } else {
             anyhow::bail!("Unknown stream header and no matching resource: {}", header);
         }
@@ -1624,6 +2423,324 @@ async fn handle_tun_stream(
         let ack = [0u8; 2]; // Empty ack
         send.write_all(&ack).await?;
     }
+
+    Ok(())
+}
+
+// =============================================================================
+// K8s API Proxy (for authenticated kubectl access)
+// =============================================================================
+
+/// Cached JWT token for K8s authentication
+#[derive(Debug, Clone)]
+struct CachedK8sToken {
+    jwt: String,
+    user_email: String,
+    expires_at: DateTime<Utc>,
+}
+
+impl CachedK8sToken {
+    fn is_expired(&self) -> bool {
+        // Consider expired if less than 30 seconds remaining
+        Utc::now() + chrono::Duration::seconds(30) > self.expires_at
+    }
+}
+
+/// K8s proxy state - holds token cache and configuration
+struct K8sProxyState {
+    /// JWT token cache: user_email -> CachedK8sToken
+    token_cache: HashMap<String, CachedK8sToken>,
+    /// K8s gateway URL to forward requests to
+    gateway_url: String,
+    /// Backend control URL for JWT requests
+    control_url: String,
+    /// Agent auth key for requesting JWTs
+    auth_key: Option<String>,
+    /// Network ID for token requests
+    network_id: Option<String>,
+}
+
+impl K8sProxyState {
+    fn new(gateway_url: String, control_url: String, auth_key: Option<String>, network_id: Option<String>) -> Self {
+        Self {
+            token_cache: HashMap::new(),
+            gateway_url,
+            control_url,
+            auth_key,
+            network_id,
+        }
+    }
+
+    /// Get or refresh JWT for a user
+    async fn get_token(&mut self, user_email: &str) -> Result<String> {
+        // Check cache first
+        if let Some(cached) = self.token_cache.get(user_email) {
+            if !cached.is_expired() {
+                debug!("Using cached K8s token for {}", user_email);
+                return Ok(cached.jwt.clone());
+            }
+        }
+
+        // Request new token from backend
+        info!("Requesting K8s token for {} from backend", user_email);
+        let token = self.request_token_from_backend(user_email).await?;
+
+        // Cache it (assume 15 minute expiry if not specified)
+        let cached = CachedK8sToken {
+            jwt: token.clone(),
+            user_email: user_email.to_string(),
+            expires_at: Utc::now() + chrono::Duration::minutes(15),
+        };
+        self.token_cache.insert(user_email.to_string(), cached);
+
+        Ok(token)
+    }
+
+    /// Request JWT from backend control server
+    async fn request_token_from_backend(&self, user_email: &str) -> Result<String> {
+        let url = format!("{}/api/v1/agent/k8s-token", self.control_url.trim_end_matches('/'));
+
+        let body = serde_json::json!({
+            "user_email": user_email,
+            "network_id": self.network_id,
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .context("Failed to create HTTP client")?;
+
+        let mut req_builder = client.post(&url).json(&body);
+
+        if let Some(ref key) = self.auth_key {
+            req_builder = req_builder.header("X-Agent-Key", key);
+        }
+
+        let response = req_builder.send().await
+            .context("Failed to request K8s token from backend")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get K8s token ({}): {}", status, body);
+        }
+
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            token: String,
+            #[serde(default)]
+            expires_at: Option<String>,
+        }
+
+        let token_resp: TokenResponse = response.json().await
+            .context("Failed to parse K8s token response")?;
+
+        Ok(token_resp.token)
+    }
+}
+
+/// Run K8s API proxy server
+/// Listens on specified port, intercepts kubectl requests, injects JWT, forwards to gateway
+async fn run_k8s_proxy(
+    agent_state: Arc<RwLock<AgentState>>,
+    k8s_state: Arc<RwLock<K8sProxyState>>,
+    listen_port: u16,
+) -> Result<()> {
+    // Generate self-signed certificate for HTTPS
+    let (certs, key) = generate_self_signed_cert()?;
+
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .context("Failed to create TLS config")?;
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    let bind_addr = format!("0.0.0.0:{}", listen_port);
+    let listener = TcpListener::bind(&bind_addr).await
+        .context(format!("Failed to bind K8s proxy on {}", bind_addr))?;
+
+    info!("K8s API proxy listening on https://{}", bind_addr);
+    info!("Configure kubectl with: kubectl config set-cluster mesh --server=https://127.0.0.1:{}", listen_port);
+
+    loop {
+        let (tcp_stream, peer_addr) = listener.accept().await?;
+        let agent_state = agent_state.clone();
+        let k8s_state = k8s_state.clone();
+        let tls_acceptor = tls_acceptor.clone();
+
+        tokio::spawn(async move {
+            match tls_acceptor.accept(tcp_stream).await {
+                Ok(tls_stream) => {
+                    if let Err(e) = handle_k8s_request(agent_state, k8s_state, tls_stream, peer_addr).await {
+                        warn!("K8s proxy request error from {}: {}", peer_addr, e);
+                    }
+                }
+                Err(e) => {
+                    debug!("TLS handshake failed from {}: {}", peer_addr, e);
+                }
+            }
+        });
+    }
+}
+
+/// Handle a single K8s API request
+async fn handle_k8s_request(
+    agent_state: Arc<RwLock<AgentState>>,
+    k8s_state: Arc<RwLock<K8sProxyState>>,
+    mut tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    peer_addr: SocketAddr,
+) -> Result<()> {
+    // Read HTTP request
+    let mut buf = vec![0u8; 8192];
+    let n = tls_stream.read(&mut buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let request_data = &buf[..n];
+    let request_str = String::from_utf8_lossy(request_data);
+
+    // Parse basic HTTP request info (method, path)
+    let first_line = request_str.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        anyhow::bail!("Invalid HTTP request: {}", first_line);
+    }
+    let method = parts[0];
+    let path = parts[1];
+
+    debug!("K8s proxy: {} {} from {}", method, path, peer_addr);
+
+    // Look up VPN session by client IP to get user identity
+    let client_ip = peer_addr.ip().to_string();
+    let user_email = {
+        let state = agent_state.read().await;
+        state.get_session_by_ip(&client_ip)
+            .map(|s| s.user_email.clone())
+    };
+
+    let user_email = match user_email {
+        Some(email) => email,
+        None => {
+            // No VPN session found - reject request
+            warn!("K8s proxy: No VPN session for client {}", client_ip);
+            let response = "HTTP/1.1 401 Unauthorized\r\n\
+                Content-Type: application/json\r\n\
+                Content-Length: 68\r\n\r\n\
+                {\"error\":\"unauthorized\",\"message\":\"No VPN session for this client\"}";
+            tls_stream.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+
+    info!("K8s proxy: {} {} from {} (user: {})", method, path, client_ip, user_email);
+
+    // Get JWT token for user
+    let jwt = {
+        let mut k8s = k8s_state.write().await;
+        match k8s.get_token(&user_email).await {
+            Ok(token) => token,
+            Err(e) => {
+                warn!("K8s proxy: Failed to get token for {}: {}", user_email, e);
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\n\
+                    Content-Type: application/json\r\n\
+                    Content-Length: {}\r\n\r\n\
+                    {{\"error\":\"token_error\",\"message\":\"{}\"}}",
+                    47 + e.to_string().len(),
+                    e
+                );
+                tls_stream.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        }
+    };
+
+    // Get gateway URL
+    let gateway_url = {
+        let k8s = k8s_state.read().await;
+        k8s.gateway_url.clone()
+    };
+
+    // Forward request to K8s gateway with JWT
+    let forwarded_url = format!("{}{}", gateway_url.trim_end_matches('/'), path);
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true) // Accept self-signed gateway certs
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Failed to create HTTP client for K8s gateway")?;
+
+    // Build forwarded request
+    let req_builder = match method {
+        "GET" => client.get(&forwarded_url),
+        "POST" => client.post(&forwarded_url),
+        "PUT" => client.put(&forwarded_url),
+        "PATCH" => client.patch(&forwarded_url),
+        "DELETE" => client.delete(&forwarded_url),
+        _ => client.request(reqwest::Method::from_bytes(method.as_bytes())?, &forwarded_url),
+    };
+
+    // Extract request body if present (for POST/PUT/PATCH)
+    let body_start = request_str.find("\r\n\r\n").map(|i| i + 4);
+    let body = body_start.and_then(|start| {
+        if start < request_data.len() {
+            Some(request_data[start..].to_vec())
+        } else {
+            None
+        }
+    });
+
+    let mut req_builder = req_builder
+        .header("Authorization", format!("Bearer {}", jwt))
+        .header("X-Forwarded-For", &client_ip)
+        .header("X-Forwarded-User", &user_email);
+
+    // Copy relevant headers from original request
+    for line in request_str.lines().skip(1) {
+        if line.is_empty() || line == "\r" {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim().to_lowercase();
+            let value = value.trim();
+            // Forward content-type and accept headers
+            if key == "content-type" || key == "accept" {
+                req_builder = req_builder.header(&key, value);
+            }
+        }
+    }
+
+    if let Some(body_data) = body {
+        req_builder = req_builder.body(body_data);
+    }
+
+    // Send request to gateway
+    let response = req_builder.send().await
+        .context("Failed to forward request to K8s gateway")?;
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes().await?;
+
+    // Build HTTP response
+    let mut response_str = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status.canonical_reason().unwrap_or(""));
+
+    // Copy headers
+    for (key, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            response_str.push_str(&format!("{}: {}\r\n", key, v));
+        }
+    }
+    response_str.push_str("\r\n");
+
+    // Send response back to client
+    tls_stream.write_all(response_str.as_bytes()).await?;
+    tls_stream.write_all(&body).await?;
+
+    debug!("K8s proxy: {} {} -> {} ({} bytes)", method, path, status, body.len());
 
     Ok(())
 }
@@ -1718,6 +2835,34 @@ async fn main() -> Result<()> {
 
         info!("QUIC server: udp://0.0.0.0:{}", quic_port);
         info!("Direct mode - port {} must be accessible to clients", quic_port);
+    }
+
+    // Start K8s API proxy if enabled
+    if args.k8s_proxy_enabled {
+        if let Some(ref gateway_url) = args.k8s_gateway_url {
+            let k8s_state = {
+                let agent = state.read().await;
+                K8sProxyState::new(
+                    gateway_url.clone(),
+                    agent.control_url.clone(),
+                    agent.auth_key.clone(),
+                    agent.network_id.clone(),
+                )
+            };
+            let k8s_state = Arc::new(RwLock::new(k8s_state));
+            let state_clone = state.clone();
+            let k8s_port = args.k8s_proxy_port;
+
+            tokio::spawn(async move {
+                if let Err(e) = run_k8s_proxy(state_clone, k8s_state, k8s_port).await {
+                    error!("K8s proxy error: {}", e);
+                }
+            });
+
+            info!("K8s proxy: https://0.0.0.0:{} -> {}", args.k8s_proxy_port, gateway_url);
+        } else {
+            warn!("K8s proxy enabled but --k8s-gateway-url not set, skipping");
+        }
     }
 
     // Run health server (blocks until shutdown)
