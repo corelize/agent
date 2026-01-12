@@ -125,7 +125,12 @@ fn test_new_recording_id_valid_characters() {
 // Resource Type Detection Tests
 // -------------------------------------------------------------------------
 
-fn make_test_resource(protocol: &str, hostname: &str, target_host: &str, target_port: u16) -> Resource {
+fn make_test_resource(
+    protocol: &str,
+    hostname: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Resource {
     Resource {
         id: "test".to_string(),
         name: "test".to_string(),
@@ -138,6 +143,7 @@ fn make_test_resource(protocol: &str, hostname: &str, target_host: &str, target_
         agent_id: "agent".to_string(),
         port_mode: PortMode::All,
         ports: None,
+        network_id: None,
     }
 }
 
@@ -249,46 +255,79 @@ fn test_should_not_record_tcp() {
 
 #[test]
 fn test_extract_query_type_select() {
-    assert_eq!(extract_query_type("SELECT * FROM users"), Some("SELECT".to_string()));
-    assert_eq!(extract_query_type("select id from users"), Some("SELECT".to_string()));
-    assert_eq!(extract_query_type("  SELECT * FROM users"), Some("SELECT".to_string()));
+    assert_eq!(
+        extract_query_type("SELECT * FROM users"),
+        Some("SELECT".to_string())
+    );
+    assert_eq!(
+        extract_query_type("select id from users"),
+        Some("SELECT".to_string())
+    );
+    assert_eq!(
+        extract_query_type("  SELECT * FROM users"),
+        Some("SELECT".to_string())
+    );
 }
 
 #[test]
 fn test_extract_query_type_insert() {
-    assert_eq!(extract_query_type("INSERT INTO users VALUES (1)"), Some("INSERT".to_string()));
-    assert_eq!(extract_query_type("insert into users (id) values (1)"), Some("INSERT".to_string()));
+    assert_eq!(
+        extract_query_type("INSERT INTO users VALUES (1)"),
+        Some("INSERT".to_string())
+    );
+    assert_eq!(
+        extract_query_type("insert into users (id) values (1)"),
+        Some("INSERT".to_string())
+    );
 }
 
 #[test]
 fn test_extract_query_type_update() {
-    assert_eq!(extract_query_type("UPDATE users SET name = 'test'"), Some("UPDATE".to_string()));
+    assert_eq!(
+        extract_query_type("UPDATE users SET name = 'test'"),
+        Some("UPDATE".to_string())
+    );
 }
 
 #[test]
 fn test_extract_query_type_delete() {
-    assert_eq!(extract_query_type("DELETE FROM users WHERE id = 1"), Some("DELETE".to_string()));
+    assert_eq!(
+        extract_query_type("DELETE FROM users WHERE id = 1"),
+        Some("DELETE".to_string())
+    );
 }
 
 #[test]
 fn test_extract_query_type_create() {
-    assert_eq!(extract_query_type("CREATE TABLE users (id INT)"), Some("CREATE".to_string()));
+    assert_eq!(
+        extract_query_type("CREATE TABLE users (id INT)"),
+        Some("CREATE".to_string())
+    );
 }
 
 #[test]
 fn test_extract_query_type_drop() {
-    assert_eq!(extract_query_type("DROP TABLE users"), Some("DROP".to_string()));
+    assert_eq!(
+        extract_query_type("DROP TABLE users"),
+        Some("DROP".to_string())
+    );
 }
 
 #[test]
 fn test_extract_query_type_alter() {
-    assert_eq!(extract_query_type("ALTER TABLE users ADD COLUMN name VARCHAR"), Some("ALTER".to_string()));
+    assert_eq!(
+        extract_query_type("ALTER TABLE users ADD COLUMN name VARCHAR"),
+        Some("ALTER".to_string())
+    );
 }
 
 #[test]
 fn test_extract_query_type_begin() {
     assert_eq!(extract_query_type("BEGIN"), Some("BEGIN".to_string()));
-    assert_eq!(extract_query_type("START TRANSACTION"), Some("BEGIN".to_string()));
+    assert_eq!(
+        extract_query_type("START TRANSACTION"),
+        Some("BEGIN".to_string())
+    );
 }
 
 #[test]
@@ -447,6 +486,7 @@ fn test_mesh_resource_response_to_resource() {
         protocol: "postgresql".to_string(),
         agent_id: "agent_789".to_string(),
         enabled: true,
+        network_id: Some("ntwk_test123".to_string()),
     };
 
     let resource: Resource = response.into();
@@ -650,7 +690,12 @@ fn test_audit_event_type_serialization() {
 #[test]
 fn test_session_recording_new() {
     let resource = make_test_resource("postgresql", "db.internal", "localhost", 5432);
-    let recording = SessionRecording::new(&resource, "postgresql", Some("user@test.com".to_string()), "10.0.0.1".to_string());
+    let recording = SessionRecording::new(
+        &resource,
+        "postgresql",
+        Some("user@test.com".to_string()),
+        "10.0.0.1".to_string(),
+    );
 
     assert!(recording.id.starts_with("rec_"));
     assert_eq!(recording.resource_id, "test");
@@ -668,7 +713,8 @@ fn test_session_recording_new() {
 #[test]
 fn test_session_recording_add_event() {
     let resource = make_test_resource("postgresql", "db.internal", "localhost", 5432);
-    let mut recording = SessionRecording::new(&resource, "postgresql", None, "10.0.0.1".to_string());
+    let mut recording =
+        SessionRecording::new(&resource, "postgresql", None, "10.0.0.1".to_string());
 
     // Add client-to-server event
     recording.add_event(Direction::C2s, vec![1, 2, 3, 4]);
