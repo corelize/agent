@@ -487,7 +487,6 @@ fn test_mesh_resource_response_to_resource() {
         agent_id: "agent_789".to_string(),
         network_id: Some("ntwk_test123".to_string()),
         enabled: true,
-        network_id: Some("ntwk_test123".to_string()),
     };
 
     let resource: Resource = response.into();
