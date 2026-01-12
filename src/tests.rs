@@ -513,7 +513,7 @@ fn test_agent_state_session_management() {
         registered_at: None,
     };
 
-    let mut state = AgentState::new(config, "http://localhost:8080".to_string());
+    let mut state = AgentState::new(config, "http://localhost:8080".to_string(), None);
 
     // Register session
     let session = state.register_session("user@test.com".to_string(), "10.0.0.1".to_string());

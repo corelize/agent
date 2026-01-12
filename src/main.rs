@@ -114,6 +114,12 @@ struct Args {
     /// (e.g., https://k8s-gateway.example.com)
     #[arg(long, env = "MESH_K8S_GATEWAY_URL")]
     k8s_gateway_url: Option<String>,
+
+    /// Stable UUID for agent identity (from Kubernetes operator identity secret)
+    /// When set, this UUID is sent to the backend for persistent agent identity
+    /// across pod restarts. All replicas of the same MeshAgent CR share this UUID.
+    #[arg(long, env = "MESH_AGENT_UUID")]
+    agent_uuid: Option<String>,
 }
 
 // =============================================================================
@@ -267,6 +273,9 @@ pub struct AgentState {
     pub relay_token: Option<String>,
     /// Network ID for re-registration
     pub network_id: Option<String>,
+    /// Stable UUID for persistent agent identity (from K8s operator)
+    /// Used to maintain identity across pod restarts
+    pub agent_uuid: Option<String>,
     /// VPN sessions - maps client IP to session info
     pub vpn_sessions: HashMap<String, VpnSession>,
 }
@@ -288,6 +297,10 @@ struct RegisterRequest {
     agent_type: String,
     transport_type: String,
     version: Option<String>,
+    /// Stable UUID for persistent agent identity (from K8s operator)
+    /// When set, backend uses this to maintain identity across pod restarts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_uuid: Option<String>,
 }
 
 /// Registration response
@@ -813,7 +826,7 @@ impl AgentConfig {
 }
 
 impl AgentState {
-    pub fn new(config: AgentConfig, control_url: String) -> Self {
+    pub fn new(config: AgentConfig, control_url: String, agent_uuid: Option<String>) -> Self {
         Self {
             config,
             resources: HashMap::new(),
@@ -822,6 +835,7 @@ impl AgentState {
             server_agent_id: None,
             relay_token: None,
             network_id: None,
+            agent_uuid,
             vpn_sessions: HashMap::new(),
         }
     }
@@ -900,6 +914,7 @@ async fn register_with_control(
             agent_type: "proxy".to_string(),
             transport_type: "quic".to_string(),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            agent_uuid: state.agent_uuid.clone(),
         };
         (url, request, network_id)
     };
@@ -2769,9 +2784,12 @@ async fn main() -> Result<()> {
     config.advertised_routes = parse_networks(args.advertise_routes);
 
     info!("Agent ID: {}", config.id);
+    if let Some(ref uuid) = args.agent_uuid {
+        info!("Persistent agent UUID (from K8s operator): {}", uuid);
+    }
 
     // Create agent state (resources synced from network, no static proxies)
-    let state = Arc::new(RwLock::new(AgentState::new(config, args.server.clone())));
+    let state = Arc::new(RwLock::new(AgentState::new(config, args.server.clone(), args.agent_uuid.clone())));
 
     // Resolve network: prefer --network-id, otherwise resolve --network slug
     let network_id = match (args.network_id, args.network) {
