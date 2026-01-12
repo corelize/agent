@@ -170,6 +170,7 @@ pub struct Resource {
 /// Response from mesh resources list endpoint
 #[derive(Debug, Deserialize)]
 struct MeshResourceListResponse {
+    #[allow(dead_code)]
     pub total: usize,
     pub resources: Vec<MeshResourceResponse>,
 }
@@ -190,6 +191,7 @@ struct MeshResourceResponse {
     /// Network ID for org-scoping (should match agent's network)
     #[serde(default)]
     pub network_id: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     pub enabled: bool,
 }
@@ -739,7 +741,9 @@ struct CreateRecordingRequest {
 #[derive(Debug, Deserialize)]
 struct CreateRecordingResponse {
     id: String,
+    #[allow(dead_code)]
     status: String,
+    #[allow(dead_code)]
     #[serde(default)]
     started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -2487,6 +2491,7 @@ async fn handle_tun_stream(
 #[derive(Debug, Clone)]
 struct CachedK8sToken {
     jwt: String,
+    #[allow(dead_code)]
     user_email: String,
     expires_at: DateTime<Utc>,
 }
@@ -2580,6 +2585,7 @@ impl K8sProxyState {
         #[derive(Deserialize)]
         struct TokenResponse {
             token: String,
+            #[allow(dead_code)]
             #[serde(default)]
             expires_at: Option<String>,
         }

@@ -125,7 +125,12 @@ fn test_new_recording_id_valid_characters() {
 // Resource Type Detection Tests
 // -------------------------------------------------------------------------
 
-fn make_test_resource(protocol: &str, hostname: &str, target_host: &str, target_port: u16) -> Resource {
+fn make_test_resource(
+    protocol: &str,
+    hostname: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Resource {
     Resource {
         id: "test".to_string(),
         name: "test".to_string(),
@@ -138,6 +143,7 @@ fn make_test_resource(protocol: &str, hostname: &str, target_host: &str, target_
         agent_id: "agent".to_string(),
         port_mode: PortMode::All,
         ports: None,
+        network_id: None,
     }
 }
 
@@ -446,6 +452,7 @@ fn test_mesh_resource_response_to_resource() {
         target_port: 5432,
         protocol: "postgresql".to_string(),
         agent_id: "agent_789".to_string(),
+        network_id: Some("ntwk_test123".to_string()),
         enabled: true,
     };
 
