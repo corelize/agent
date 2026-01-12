@@ -376,10 +376,8 @@ struct AuditEventRequest {
 /// Generate a recording ID with rec_ prefix (matches backend format)
 fn new_recording_id() -> String {
     const ALPHABET: [char; 36] = [
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
-        'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
-        'u', 'v', 'w', 'x', 'y', 'z',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
+        'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
     ];
     // Generate 16 random characters
     let mut id = String::with_capacity(16);
@@ -484,7 +482,7 @@ pub struct RecordingEvent {
 /// Serialize Vec<u8> as base64
 mod base64_bytes {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use serde::{Serializer, Serialize};
+    use serde::{Serialize, Serializer};
 
     pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -642,11 +640,7 @@ fn parse_postgresql_message(
                         let tag_bytes = &data[5..];
                         if let Some(end) = tag_bytes.iter().position(|&b| b == 0) {
                             if let Ok(tag) = std::str::from_utf8(&tag_bytes[..end]) {
-                                return (
-                                    Some(tag.to_string()),
-                                    Some("response".to_string()),
-                                    None,
-                                );
+                                return (Some(tag.to_string()), Some("response".to_string()), None);
                             }
                         }
                     }
@@ -673,11 +667,7 @@ fn parse_postgresql_message(
                                 break;
                             }
                         }
-                        return (
-                            Some(error_msg),
-                            Some("error".to_string()),
-                            None,
-                        );
+                        return (Some(error_msg), Some("error".to_string()), None);
                     }
                     (None, Some("error".to_string()), None)
                 }
@@ -853,8 +843,10 @@ impl AgentState {
     /// Register or update a VPN session for a client
     pub fn register_session(&mut self, user_id: String, client_ip: String) -> VpnSession {
         let session = VpnSession::new(user_id, client_ip.clone());
-        info!("Registered VPN session: {} -> {} (session: {})",
-            session.user_email, client_ip, session.session_id);
+        info!(
+            "Registered VPN session: {} -> {} (session: {})",
+            session.user_email, client_ip, session.session_id
+        );
         self.vpn_sessions.insert(client_ip, session.clone());
         session
     }
@@ -874,8 +866,10 @@ impl AgentState {
     /// Remove session by client IP
     pub fn remove_session(&mut self, client_ip: &str) -> Option<VpnSession> {
         if let Some(session) = self.vpn_sessions.remove(client_ip) {
-            info!("Removed VPN session: {} -> {} (session: {})",
-                session.user_email, client_ip, session.session_id);
+            info!(
+                "Removed VPN session: {} -> {} (session: {})",
+                session.user_email, client_ip, session.session_id
+            );
             Some(session)
         } else {
             None
@@ -900,7 +894,10 @@ async fn register_with_control(
 ) -> Result<()> {
     let (url, request, network_id) = {
         let state = state.read().await;
-        let url = format!("{}/api/v1/agents/register", state.control_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v1/agents/register",
+            state.control_url.trim_end_matches('/')
+        );
 
         // Detect local IP for client connectivity
         let local_ip = get_local_ip();
@@ -951,11 +948,14 @@ async fn register_with_control(
         // Check for network_not_found error
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
             if json.get("error").and_then(|e| e.as_str()) == Some("network_not_found") {
-                let message = json.get("message")
+                let message = json
+                    .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("Network not found");
                 error!("FATAL: {}", message);
-                error!("Please check your NETWORK_ID environment variable or --network-id argument");
+                error!(
+                    "Please check your NETWORK_ID environment variable or --network-id argument"
+                );
                 error!("Use --network <slug> to specify network by name, or verify the network exists in the control server");
                 std::process::exit(1);
             }
@@ -985,8 +985,10 @@ async fn register_with_control(
     // Log both local agent ID (used for relay) and server-assigned ID
     {
         let s = state.read().await;
-        info!("Registered - Assigned IP: {}, Local Agent ID: {}, Server Agent ID: {}",
-              result.mesh_ip, s.config.id, result.agent_id);
+        info!(
+            "Registered - Assigned IP: {}, Local Agent ID: {}, Server Agent ID: {}",
+            result.mesh_ip, s.config.id, result.agent_id
+        );
     }
     info!("Relay token received for relay server authentication");
     if let Some(ref cidr) = result.mesh_cidr {
@@ -1005,8 +1007,16 @@ struct NetworkLookupResponse {
 }
 
 /// Resolve network slug to network ID via control server
-async fn resolve_network_slug(server_url: &str, slug: &str, auth_key: Option<&str>) -> Result<String> {
-    let url = format!("{}/api/v1/vpn/networks/by-slug/{}", server_url.trim_end_matches('/'), slug);
+async fn resolve_network_slug(
+    server_url: &str,
+    slug: &str,
+    auth_key: Option<&str>,
+) -> Result<String> {
+    let url = format!(
+        "{}/api/v1/vpn/networks/by-slug/{}",
+        server_url.trim_end_matches('/'),
+        slug
+    );
 
     info!("Resolving network slug '{}' to ID", slug);
 
@@ -1028,10 +1038,15 @@ async fn resolve_network_slug(server_url: &str, slug: &str, auth_key: Option<&st
         anyhow::bail!("Network lookup failed ({}): {}", status, body);
     }
 
-    let result: NetworkLookupResponse = response.json().await
+    let result: NetworkLookupResponse = response
+        .json()
+        .await
         .context("Failed to parse network lookup response")?;
 
-    info!("Resolved network '{}' (slug: {}) to ID: {}", result.name, result.slug, result.id);
+    info!(
+        "Resolved network '{}' (slug: {}) to ID: {}",
+        result.name, result.slug, result.id
+    );
 
     Ok(result.id)
 }
@@ -1052,7 +1067,12 @@ async fn send_keepalive(state: &Arc<RwLock<AgentState>>) -> Result<()> {
             "{}/api/v1/agents/heartbeat",
             state.control_url.trim_end_matches('/')
         );
-        (url, state.auth_key.clone(), env!("CARGO_PKG_VERSION").to_string(), server_agent_id)
+        (
+            url,
+            state.auth_key.clone(),
+            env!("CARGO_PKG_VERSION").to_string(),
+            server_agent_id,
+        )
     };
 
     // Body matches AgentHeartbeatRequest structure expected by backend
@@ -1180,7 +1200,10 @@ async fn upload_recording(
             if response.status().is_success() {
                 match response.json::<CreateRecordingResponse>().await {
                     Ok(resp) => {
-                        info!("Created recording {} for resource {}", resp.id, recording.resource_name);
+                        info!(
+                            "Created recording {} for resource {}",
+                            resp.id, recording.resource_name
+                        );
                         resp.id
                     }
                     Err(e) => {
@@ -1203,7 +1226,11 @@ async fn upload_recording(
 
     // Step 2: Add events (in batches if there are many)
     if !recording.events.is_empty() {
-        let events_url = format!("{}/api/v1/recordings/{}/events", control_url.trim_end_matches('/'), recording_id);
+        let events_url = format!(
+            "{}/api/v1/recordings/{}/events",
+            control_url.trim_end_matches('/'),
+            recording_id
+        );
 
         // Batch events in chunks of 100 to avoid oversized requests
         for chunk in recording.events.chunks(100) {
@@ -1230,11 +1257,19 @@ async fn upload_recording(
             }
         }
 
-        debug!("Uploaded {} events for recording {}", recording.events.len(), recording_id);
+        debug!(
+            "Uploaded {} events for recording {}",
+            recording.events.len(),
+            recording_id
+        );
     }
 
     // Step 3: Complete the recording
-    let complete_url = format!("{}/api/v1/recordings/{}/complete", control_url.trim_end_matches('/'), recording_id);
+    let complete_url = format!(
+        "{}/api/v1/recordings/{}/complete",
+        control_url.trim_end_matches('/'),
+        recording_id
+    );
     let complete_req = CompleteRecordingRequest {
         status: Some("completed".to_string()),
     };
@@ -1274,7 +1309,10 @@ async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
     let (url, auth_key, agent_name) = {
         let state = state.read().await;
         // Use the agents/resources endpoint which filters by agent via X-Agent-Key + X-Agent-Name
-        let url = format!("{}/api/v1/agents/resources", state.control_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v1/agents/resources",
+            state.control_url.trim_end_matches('/')
+        );
         (url, state.auth_key.clone(), state.config.name.clone())
     };
 
@@ -1300,7 +1338,8 @@ async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
     let list_response: MeshResourceListResponse = response.json().await?;
 
     // Convert to HashMap<id, Resource>
-    let my_resources: HashMap<String, Resource> = list_response.resources
+    let my_resources: HashMap<String, Resource> = list_response
+        .resources
         .into_iter()
         .map(|r| {
             let id = r.id.clone();
@@ -1314,41 +1353,58 @@ async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
         let len_changed = state.resources.len() != my_resources.len();
 
         if len_changed {
-            debug!("Resource count changed: {} -> {}", state.resources.len(), my_resources.len());
+            debug!(
+                "Resource count changed: {} -> {}",
+                state.resources.len(),
+                my_resources.len()
+            );
         }
 
-        let content_changed = my_resources.iter().any(|(id, new_res)| {
-            match state.resources.get(id) {
-                None => {
-                    debug!("New resource ID not in state: {}", id);
-                    true
-                }
-                Some(old_res) => {
-                    let changed = old_res.mesh_port != new_res.mesh_port
-                        || old_res.target_host != new_res.target_host
-                        || old_res.target_port != new_res.target_port;
-                    if changed {
-                        debug!("Resource {} changed: port {}->{}  host {}->{}  target_port {}->{}",
-                            id, old_res.mesh_port, new_res.mesh_port,
-                            old_res.target_host, new_res.target_host,
-                            old_res.target_port, new_res.target_port);
+        let content_changed =
+            my_resources
+                .iter()
+                .any(|(id, new_res)| match state.resources.get(id) {
+                    None => {
+                        debug!("New resource ID not in state: {}", id);
+                        true
                     }
-                    changed
-                }
-            }
-        });
+                    Some(old_res) => {
+                        let changed = old_res.mesh_port != new_res.mesh_port
+                            || old_res.target_host != new_res.target_host
+                            || old_res.target_port != new_res.target_port;
+                        if changed {
+                            debug!(
+                                "Resource {} changed: port {}->{}  host {}->{}  target_port {}->{}",
+                                id,
+                                old_res.mesh_port,
+                                new_res.mesh_port,
+                                old_res.target_host,
+                                new_res.target_host,
+                                old_res.target_port,
+                                new_res.target_port
+                            );
+                        }
+                        changed
+                    }
+                });
 
         len_changed || content_changed
     };
 
     if resources_changed {
-        info!("Resource configuration updated - {} resources available for QUIC routing", my_resources.len());
+        info!(
+            "Resource configuration updated - {} resources available for QUIC routing",
+            my_resources.len()
+        );
 
         // Log each resource for visibility
         for (_id, resource) in &my_resources {
             if resource.port_mode == PortMode::Specific {
                 if let Some(ref ports) = resource.ports {
-                    info!("  → {} → {} ({})", resource.hostname, resource.target_host, ports);
+                    info!(
+                        "  → {} → {} ({})",
+                        resource.hostname, resource.target_host, ports
+                    );
                 } else {
                     info!("  → {} → {}", resource.hostname, resource.target_host);
                 }
@@ -1379,7 +1435,8 @@ async fn proxy_to_backend(
     recording: Option<&mut SessionRecording>,
 ) -> Result<()> {
     let target_addr = format!("{}:{}", target_host, target_port);
-    let mut backend = TcpStream::connect(&target_addr).await
+    let mut backend = TcpStream::connect(&target_addr)
+        .await
         .context(format!("Failed to connect to backend: {}", target_addr))?;
 
     if recording.is_some() {
@@ -1470,7 +1527,8 @@ async fn proxy_to_backend_simple(
     target_port: u16,
 ) -> Result<()> {
     let target_addr = format!("{}:{}", target_host, target_port);
-    let mut backend = TcpStream::connect(&target_addr).await
+    let mut backend = TcpStream::connect(&target_addr)
+        .await
         .context(format!("Failed to connect to backend: {}", target_addr))?;
 
     info!("QUIC → TCP proxy established: {}", target_addr);
@@ -1576,7 +1634,10 @@ async fn resource_sync_loop(state: Arc<RwLock<AgentState>>) {
         if state.resources.is_empty() {
             info!("No resources assigned to this agent yet");
         } else {
-            info!("Initial resource load complete - {} resources ready", state.resources.len());
+            info!(
+                "Initial resource load complete - {} resources ready",
+                state.resources.len()
+            );
         }
     }
 
@@ -1668,7 +1729,7 @@ fn create_quic_server_config() -> Result<ServerConfig> {
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-            .context("Failed to create QUIC server config")?
+            .context("Failed to create QUIC server config")?,
     ));
 
     // Configure transport to match client keepalive settings
@@ -1690,8 +1751,8 @@ async fn run_quic_server(state: Arc<RwLock<AgentState>>, quic_port: u16) -> Resu
     let server_config = create_quic_server_config()?;
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", quic_port).parse()?;
-    let endpoint = Endpoint::server(server_config, bind_addr)
-        .context("Failed to create QUIC endpoint")?;
+    let endpoint =
+        Endpoint::server(server_config, bind_addr).context("Failed to create QUIC endpoint")?;
 
     info!("QUIC server listening on {}", bind_addr);
 
@@ -1789,7 +1850,7 @@ fn create_relay_client_config() -> Result<ClientConfig> {
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
     transport_config.max_idle_timeout(Some(
-        std::time::Duration::from_secs(300)  // 5 minutes - matches relay
+        std::time::Duration::from_secs(300) // 5 minutes - matches relay
             .try_into()
             .unwrap(),
     ));
@@ -1815,8 +1876,8 @@ async fn run_relay_client(
     info!("Connecting to relay server: {}", relay_addr);
 
     // Create client endpoint
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)
-        .context("Failed to create QUIC client endpoint")?;
+    let mut endpoint =
+        Endpoint::client("0.0.0.0:0".parse()?).context("Failed to create QUIC client endpoint")?;
     endpoint.set_default_client_config(client_config);
 
     // Connect to relay
@@ -1939,10 +2000,7 @@ async fn run_relay_client(
 }
 
 /// Run relay client with automatic reconnection
-async fn run_relay_client_loop(
-    state: Arc<RwLock<AgentState>>,
-    relay_url: String,
-) -> Result<()> {
+async fn run_relay_client_loop(state: Arc<RwLock<AgentState>>, relay_url: String) -> Result<()> {
     // Try parsing as SocketAddr first (IP:port), otherwise resolve as hostname:port
     let relay_addr: SocketAddr = match relay_url.parse() {
         Ok(addr) => addr,
@@ -1953,7 +2011,9 @@ async fn run_relay_client_loop(
                 .await
                 .context(format!("Failed to resolve relay URL: {}", relay_url))?
                 .collect();
-            addrs.into_iter().next()
+            addrs
+                .into_iter()
+                .next()
                 .ok_or_else(|| anyhow::anyhow!("No addresses found for relay URL: {}", relay_url))?
         }
     };
@@ -1971,7 +2031,14 @@ async fn run_relay_client_loop(
     };
 
     loop {
-        match run_relay_client(state.clone(), relay_addr, agent_id.clone(), relay_token.clone()).await {
+        match run_relay_client(
+            state.clone(),
+            relay_addr,
+            agent_id.clone(),
+            relay_token.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 info!("Relay connection closed gracefully");
             }
@@ -2062,7 +2129,14 @@ async fn handle_quic_stream(
         let (proxy_part, forwarded_mesh_ip) = if let Some(delimiter_pos) = target.find("::") {
             let (proxy, mesh_ip_part) = target.split_at(delimiter_pos);
             let mesh_ip = mesh_ip_part.trim_start_matches("::");
-            (proxy, if mesh_ip.is_empty() { None } else { Some(mesh_ip.to_string()) })
+            (
+                proxy,
+                if mesh_ip.is_empty() {
+                    None
+                } else {
+                    Some(mesh_ip.to_string())
+                },
+            )
         } else {
             (target, None)
         };
@@ -2074,14 +2148,20 @@ async fn handle_quic_stream(
         let (host, port, user_id): (&str, u16, Option<String>) = if parts.len() == 3 {
             // New format: [user_id, port, host]
             let user_id_str = parts[0];
-            let port: u16 = parts[1].parse()
+            let port: u16 = parts[1]
+                .parse()
                 .context(format!("Invalid port in PROXY header: {}", parts[1]))?;
             let host = parts[2];
-            let user_id = if user_id_str.is_empty() { None } else { Some(user_id_str.to_string()) };
+            let user_id = if user_id_str.is_empty() {
+                None
+            } else {
+                Some(user_id_str.to_string())
+            };
             (host, port, user_id)
         } else if parts.len() == 2 {
             // Old format: [port, host] - for backwards compatibility
-            let port: u16 = parts[0].parse()
+            let port: u16 = parts[0]
+                .parse()
                 .context(format!("Invalid port in PROXY header: {}", parts[0]))?;
             let host = parts[1];
             (host, port, None)
@@ -2092,7 +2172,8 @@ async fn handle_quic_stream(
         // Determine effective client IP for audit logging:
         // - Use forwarded mesh_ip if provided by relay (client's actual mesh IP)
         // - Otherwise fall back to remote_addr (direct connection or relay's IP)
-        let effective_client_ip = forwarded_mesh_ip.as_ref()
+        let effective_client_ip = forwarded_mesh_ip
+            .as_ref()
             .map(|s| s.as_str())
             .unwrap_or_else(|| "");
         let effective_client_ip = if effective_client_ip.is_empty() {
@@ -2101,7 +2182,10 @@ async fn handle_quic_stream(
             effective_client_ip.to_string()
         };
 
-        info!("PROXY request: {}:{} (user: {:?}, client_ip: {})", host, port, user_id, effective_client_ip);
+        info!(
+            "PROXY request: {}:{} (user: {:?}, client_ip: {})",
+            host, port, user_id, effective_client_ip
+        );
 
         // Register/update VPN session if user_id is provided
         if let Some(ref uid) = user_id {
@@ -2113,7 +2197,16 @@ async fn handle_quic_stream(
         // Port enforcement: if mesh_port is set (non-zero), only that port is allowed
         // SECURITY: Network isolation - resources must belong to agent's network
         // Returns: Ok((target_host, target_port, resource_id, Option<Resource>)) or Err((message, resource_id, resource_name, allowed_port, target_host))
-        let backend: Result<Option<(String, u16, Option<String>, Option<Resource>)>, (String, Option<String>, Option<String>, Option<u16>, Option<String>)> = {
+        let backend: Result<
+            Option<(String, u16, Option<String>, Option<Resource>)>,
+            (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<u16>,
+                Option<String>,
+            ),
+        > = {
             let state = state.read().await;
             let agent_network_id = state.network_id.clone();
 
@@ -2121,9 +2214,9 @@ async fn handle_quic_stream(
             // If resource.target_port is 0, use the request port (passthrough mode)
             let effective_port = |resource: &Resource, request_port: u16| -> u16 {
                 if resource.target_port == 0 {
-                    request_port  // Passthrough: use port from request
+                    request_port // Passthrough: use port from request
                 } else {
-                    resource.target_port  // Fixed port: use configured port
+                    resource.target_port // Fixed port: use configured port
                 }
             };
 
@@ -2157,16 +2250,23 @@ async fn handle_quic_stream(
 
             // First try to find resource by hostname (e.g., echo.dev.int)
             // SECURITY: Only match resources belonging to this agent's network
-            if let Some(resource) = state.resources.values()
+            if let Some(resource) = state
+                .resources
+                .values()
                 .find(|r| r.hostname == host && network_valid(r))
             {
                 // Enforce port restriction
                 if !port_allowed(resource, port) {
-                    warn!("Port {} not allowed for resource '{}' (allowed port: {})",
-                        port, resource.name, resource.mesh_port);
+                    warn!(
+                        "Port {} not allowed for resource '{}' (allowed port: {})",
+                        port, resource.name, resource.mesh_port
+                    );
                     // Return detailed error with resource info for audit logging
                     Err((
-                        format!("Port {} not allowed for {} (allowed: {})", port, resource.name, resource.mesh_port),
+                        format!(
+                            "Port {} not allowed for {} (allowed: {})",
+                            port, resource.name, resource.mesh_port
+                        ),
                         Some(resource.id.clone()),
                         Some(resource.name.clone()),
                         Some(resource.mesh_port),
@@ -2176,31 +2276,57 @@ async fn handle_quic_stream(
                     let target_port = effective_port(resource, port);
                     info!("Found resource '{}' for hostname {} -> {}:{} (mesh_port: {}, target_port: {})",
                         resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
-                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()), Some(resource.clone()))))
+                    Ok(Some((
+                        resource.target_host.clone(),
+                        target_port,
+                        Some(resource.id.clone()),
+                        Some(resource.clone()),
+                    )))
                 }
             }
             // Then try to find resource by mesh_ip and port
             // SECURITY: Only match resources belonging to this agent's network
-            else if let Some(resource) = state.resources.values()
+            else if let Some(resource) = state
+                .resources
+                .values()
                 .find(|r| r.mesh_ip == host && r.mesh_port == port && network_valid(r))
             {
                 let target_port = effective_port(resource, port);
-                info!("Found resource '{}' for {}:{} -> {}:{} (configured port: {})",
-                    resource.name, host, port, resource.target_host, target_port, resource.target_port);
-                Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()), Some(resource.clone()))))
+                info!(
+                    "Found resource '{}' for {}:{} -> {}:{} (configured port: {})",
+                    resource.name,
+                    host,
+                    port,
+                    resource.target_host,
+                    target_port,
+                    resource.target_port
+                );
+                Ok(Some((
+                    resource.target_host.clone(),
+                    target_port,
+                    Some(resource.id.clone()),
+                    Some(resource.clone()),
+                )))
             }
             // Also try matching just mesh_ip with any port
             // SECURITY: Only match resources belonging to this agent's network
-            else if let Some(resource) = state.resources.values()
+            else if let Some(resource) = state
+                .resources
+                .values()
                 .find(|r| r.mesh_ip == host && network_valid(r))
             {
                 // Enforce port restriction for mesh_ip matches too
                 if !port_allowed(resource, port) {
-                    warn!("Port {} not allowed for resource '{}' at {} (allowed port: {})",
-                        port, resource.name, host, resource.mesh_port);
+                    warn!(
+                        "Port {} not allowed for resource '{}' at {} (allowed port: {})",
+                        port, resource.name, host, resource.mesh_port
+                    );
                     // Return detailed error with resource info for audit logging
                     Err((
-                        format!("Port {} not allowed for {} (allowed: {})", port, resource.name, resource.mesh_port),
+                        format!(
+                            "Port {} not allowed for {} (allowed: {})",
+                            port, resource.name, resource.mesh_port
+                        ),
                         Some(resource.id.clone()),
                         Some(resource.name.clone()),
                         Some(resource.mesh_port),
@@ -2210,7 +2336,12 @@ async fn handle_quic_stream(
                     let target_port = effective_port(resource, port);
                     info!("Found resource '{}' by IP only for {} -> {}:{} (mesh_port: {}, target_port: {})",
                         resource.name, host, resource.target_host, target_port, resource.mesh_port, resource.target_port);
-                    Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()), Some(resource.clone()))))
+                    Ok(Some((
+                        resource.target_host.clone(),
+                        target_port,
+                        Some(resource.id.clone()),
+                        Some(resource.clone()),
+                    )))
                 }
             }
             // For mesh IPs with no resource match, log warning
@@ -2257,7 +2388,8 @@ async fn handle_quic_stream(
                     post_audit_event(&control_url, auth_key.as_deref(), None, event).await;
                 });
 
-                send.write_all(format!("ERROR:{}\n", msg).as_bytes()).await?;
+                send.write_all(format!("ERROR:{}\n", msg).as_bytes())
+                    .await?;
                 send.finish().ok();
                 return Ok(());
             }
@@ -2266,13 +2398,19 @@ async fn handle_quic_stream(
         let (backend_host, backend_port, resource_id, resource) = backend
             .map(|(h, p, rid, res)| (h, p, rid, res))
             .unwrap_or_else(|| {
-                debug!("Using host:port from PROXY header directly: {}:{}", host, port);
+                debug!(
+                    "Using host:port from PROXY header directly: {}:{}",
+                    host, port
+                );
                 (host.to_string(), port, None, None)
             });
 
         // Determine if we should record this session
         let resource_type = resource.as_ref().map(|r| determine_resource_type(r));
-        let should_record_session = resource_type.as_ref().map(|t| should_record(t)).unwrap_or(false);
+        let should_record_session = resource_type
+            .as_ref()
+            .map(|t| should_record(t))
+            .unwrap_or(false);
 
         // Capture state info for recording before dropping the lock
         let (control_url, auth_key, network_id, agent_id) = {
@@ -2314,7 +2452,10 @@ async fn handle_quic_stream(
         // Proxy with optional session recording
         if should_record_session {
             if let (Some(res), Some(res_type)) = (resource.as_ref(), resource_type.as_ref()) {
-                info!("Proxying to backend (RECORDING {}): {}:{}", res_type, backend_host, backend_port);
+                info!(
+                    "Proxying to backend (RECORDING {}): {}:{}",
+                    res_type, backend_host, backend_port
+                );
 
                 // Create session recording
                 let mut recording = SessionRecording::new(
@@ -2324,10 +2465,20 @@ async fn handle_quic_stream(
                     effective_client_ip.clone(),
                 );
                 let recording_id = recording.id.clone();
-                info!("Started session recording {} for {} ({})", recording_id, res.name, res_type);
+                info!(
+                    "Started session recording {} for {} ({})",
+                    recording_id, res.name, res_type
+                );
 
                 // Run proxy with recording
-                let proxy_result = proxy_to_backend(send, recv, &backend_host, backend_port, Some(&mut recording)).await;
+                let proxy_result = proxy_to_backend(
+                    send,
+                    recv,
+                    &backend_host,
+                    backend_port,
+                    Some(&mut recording),
+                )
+                .await;
 
                 // Upload recording (async, fire-and-forget)
                 let ctrl_url = control_url.clone();
@@ -2343,7 +2494,8 @@ async fn handle_quic_stream(
                         agent.as_deref(),
                         uid.as_deref(),
                         recording,
-                    ).await;
+                    )
+                    .await;
                 });
 
                 proxy_result?;
@@ -2357,19 +2509,16 @@ async fn handle_quic_stream(
             info!("Proxying to backend: {}:{}", backend_host, backend_port);
             proxy_to_backend_simple(send, recv, &backend_host, backend_port).await?;
         }
-
     } else if header.starts_with("HEALTH:") {
         // Health check from VPN client - respond with OK
         debug!("Health check received");
         send.write_all(b"OK\n").await?;
         send.finish().ok();
         return Ok(());
-
     } else if header.starts_with("TUN:") {
         // TUN packet mode - for future IP packet handling
         info!("TUN stream requested");
         handle_tun_stream(send, recv, state).await?;
-
     } else {
         // Legacy: try to find resource by mesh_ip
         let target = {
@@ -2379,7 +2528,9 @@ async fn handle_quic_stream(
                 let (ip, port_str) = header.split_at(pos);
                 let port: u16 = port_str[1..].parse().unwrap_or(0);
 
-                state.resources.values()
+                state
+                    .resources
+                    .values()
                     .find(|r| r.mesh_ip == ip && r.mesh_port == port)
                     .map(|r| (r.target_host.clone(), r.target_port))
             } else {
@@ -2446,12 +2597,17 @@ async fn handle_tun_stream(
         let protocol = pkt[9];
         let dst_ip = format!("{}.{}.{}.{}", pkt[16], pkt[17], pkt[18], pkt[19]);
 
-        debug!("TUN packet: proto={} dst={} len={}", protocol, dst_ip, pkt_len);
+        debug!(
+            "TUN packet: proto={} dst={} len={}",
+            protocol, dst_ip, pkt_len
+        );
 
         // Find resource by destination IP
         let target = {
             let state = state.read().await;
-            state.resources.values()
+            state
+                .resources
+                .values()
                 .find(|r| r.mesh_ip == dst_ip)
                 .map(|r| (r.target_host.clone(), r.target_port, r.name.clone()))
         };
@@ -2460,7 +2616,10 @@ async fn handle_tun_stream(
             // For TCP (protocol 6), we need to extract the port from the TCP header
             if protocol == 6 && pkt.len() >= ihl + 4 {
                 let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
-                debug!("TCP packet to {}:{} → backend {}:{}", dst_ip, dst_port, host, port);
+                debug!(
+                    "TCP packet to {}:{} → backend {}:{}",
+                    dst_ip, dst_port, host, port
+                );
 
                 // TODO: Full TCP state machine would be complex
                 // For now, we rely on PROXY: streams for actual connections
@@ -2513,7 +2672,12 @@ struct K8sProxyState {
 }
 
 impl K8sProxyState {
-    fn new(gateway_url: String, control_url: String, auth_key: Option<String>, network_id: Option<String>) -> Self {
+    fn new(
+        gateway_url: String,
+        control_url: String,
+        auth_key: Option<String>,
+        network_id: Option<String>,
+    ) -> Self {
         Self {
             token_cache: HashMap::new(),
             gateway_url,
@@ -2550,7 +2714,10 @@ impl K8sProxyState {
 
     /// Request JWT from backend control server
     async fn request_token_from_backend(&self, user_email: &str) -> Result<String> {
-        let url = format!("{}/api/v1/agent/k8s-token", self.control_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v1/agent/k8s-token",
+            self.control_url.trim_end_matches('/')
+        );
 
         let body = serde_json::json!({
             "user_email": user_email,
@@ -2568,7 +2735,9 @@ impl K8sProxyState {
             req_builder = req_builder.header("X-Agent-Key", key);
         }
 
-        let response = req_builder.send().await
+        let response = req_builder
+            .send()
+            .await
             .context("Failed to request K8s token from backend")?;
 
         if !response.status().is_success() {
@@ -2584,7 +2753,9 @@ impl K8sProxyState {
             expires_at: Option<String>,
         }
 
-        let token_resp: TokenResponse = response.json().await
+        let token_resp: TokenResponse = response
+            .json()
+            .await
             .context("Failed to parse K8s token response")?;
 
         Ok(token_resp.token)
@@ -2610,11 +2781,15 @@ async fn run_k8s_proxy(
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
 
     let bind_addr = format!("0.0.0.0:{}", listen_port);
-    let listener = TcpListener::bind(&bind_addr).await
+    let listener = TcpListener::bind(&bind_addr)
+        .await
         .context(format!("Failed to bind K8s proxy on {}", bind_addr))?;
 
     info!("K8s API proxy listening on https://{}", bind_addr);
-    info!("Configure kubectl with: kubectl config set-cluster mesh --server=https://127.0.0.1:{}", listen_port);
+    info!(
+        "Configure kubectl with: kubectl config set-cluster mesh --server=https://127.0.0.1:{}",
+        listen_port
+    );
 
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
@@ -2625,7 +2800,9 @@ async fn run_k8s_proxy(
         tokio::spawn(async move {
             match tls_acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
-                    if let Err(e) = handle_k8s_request(agent_state, k8s_state, tls_stream, peer_addr).await {
+                    if let Err(e) =
+                        handle_k8s_request(agent_state, k8s_state, tls_stream, peer_addr).await
+                    {
                         warn!("K8s proxy request error from {}: {}", peer_addr, e);
                     }
                 }
@@ -2669,7 +2846,8 @@ async fn handle_k8s_request(
     let client_ip = peer_addr.ip().to_string();
     let user_email = {
         let state = agent_state.read().await;
-        state.get_session_by_ip(&client_ip)
+        state
+            .get_session_by_ip(&client_ip)
             .map(|s| s.user_email.clone())
     };
 
@@ -2687,7 +2865,10 @@ async fn handle_k8s_request(
         }
     };
 
-    info!("K8s proxy: {} {} from {} (user: {})", method, path, client_ip, user_email);
+    info!(
+        "K8s proxy: {} {} from {} (user: {})",
+        method, path, client_ip, user_email
+    );
 
     // Get JWT token for user
     let jwt = {
@@ -2732,7 +2913,10 @@ async fn handle_k8s_request(
         "PUT" => client.put(&forwarded_url),
         "PATCH" => client.patch(&forwarded_url),
         "DELETE" => client.delete(&forwarded_url),
-        _ => client.request(reqwest::Method::from_bytes(method.as_bytes())?, &forwarded_url),
+        _ => client.request(
+            reqwest::Method::from_bytes(method.as_bytes())?,
+            &forwarded_url,
+        ),
     };
 
     // Extract request body if present (for POST/PUT/PATCH)
@@ -2770,7 +2954,9 @@ async fn handle_k8s_request(
     }
 
     // Send request to gateway
-    let response = req_builder.send().await
+    let response = req_builder
+        .send()
+        .await
         .context("Failed to forward request to K8s gateway")?;
 
     let status = response.status();
@@ -2778,7 +2964,11 @@ async fn handle_k8s_request(
     let body = response.bytes().await?;
 
     // Build HTTP response
-    let mut response_str = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), status.canonical_reason().unwrap_or(""));
+    let mut response_str = format!(
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
 
     // Copy headers
     for (key, value) in headers.iter() {
@@ -2792,7 +2982,13 @@ async fn handle_k8s_request(
     tls_stream.write_all(response_str.as_bytes()).await?;
     tls_stream.write_all(&body).await?;
 
-    debug!("K8s proxy: {} {} -> {} ({} bytes)", method, path, status, body.len());
+    debug!(
+        "K8s proxy: {} {} -> {} ({} bytes)",
+        method,
+        path,
+        status,
+        body.len()
+    );
 
     Ok(())
 }
@@ -2807,9 +3003,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     let filter = if args.verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     info!("Starting Mesh VPN Agent");
     info!("Control server: {}", args.server);
@@ -2826,7 +3020,11 @@ async fn main() -> Result<()> {
     }
 
     // Create agent state (resources synced from network, no static proxies)
-    let state = Arc::new(RwLock::new(AgentState::new(config, args.server.clone(), args.agent_uuid.clone())));
+    let state = Arc::new(RwLock::new(AgentState::new(
+        config,
+        args.server.clone(),
+        args.agent_uuid.clone(),
+    )));
 
     // Resolve network: prefer --network-id, otherwise resolve --network slug
     let network_id = match (args.network_id, args.network) {
@@ -2889,7 +3087,10 @@ async fn main() -> Result<()> {
         });
 
         info!("QUIC server: udp://0.0.0.0:{}", quic_port);
-        info!("Direct mode - port {} must be accessible to clients", quic_port);
+        info!(
+            "Direct mode - port {} must be accessible to clients",
+            quic_port
+        );
     }
 
     // Start K8s API proxy if enabled
@@ -2914,7 +3115,10 @@ async fn main() -> Result<()> {
                 }
             });
 
-            info!("K8s proxy: https://0.0.0.0:{} -> {}", args.k8s_proxy_port, gateway_url);
+            info!(
+                "K8s proxy: https://0.0.0.0:{} -> {}",
+                args.k8s_proxy_port, gateway_url
+            );
         } else {
             warn!("K8s proxy enabled but --k8s-gateway-url not set, skipping");
         }
