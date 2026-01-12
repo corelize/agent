@@ -138,6 +138,7 @@ fn make_test_resource(protocol: &str, hostname: &str, target_host: &str, target_
         agent_id: "agent".to_string(),
         port_mode: PortMode::All,
         ports: None,
+        network_id: None,
     }
 }
 
@@ -447,6 +448,7 @@ fn test_mesh_resource_response_to_resource() {
         protocol: "postgresql".to_string(),
         agent_id: "agent_789".to_string(),
         enabled: true,
+        network_id: Some("ntwk_test123".to_string()),
     };
 
     let resource: Resource = response.into();
