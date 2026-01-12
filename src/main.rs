@@ -143,6 +143,7 @@ impl Default for PortMode {
 }
 
 /// Resource represents a backend service exposed via mesh
+/// SECURITY: Resources are org-scoped via network_id to prevent cross-org access
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource {
     pub id: String,
@@ -155,6 +156,10 @@ pub struct Resource {
     pub target_port: u16,
     pub protocol: String,
     pub agent_id: String,
+    /// Network ID for org-scoping (prevents cross-org resource access)
+    /// SECURITY: Must match agent's network_id for access to be allowed
+    #[serde(default)]
+    pub network_id: Option<String>,
     /// Port mode: all ports or specific
     #[serde(default)]
     pub port_mode: PortMode,
@@ -170,6 +175,7 @@ struct MeshResourceListResponse {
 }
 
 /// Mesh resource from server (different field types)
+/// SECURITY: Includes network_id for org-scoping validation
 #[derive(Debug, Deserialize)]
 struct MeshResourceResponse {
     pub id: String,
@@ -181,6 +187,9 @@ struct MeshResourceResponse {
     pub target_port: i32,
     pub protocol: String,
     pub agent_id: String,
+    /// Network ID for org-scoping (should match agent's network)
+    #[serde(default)]
+    pub network_id: Option<String>,
     #[serde(default)]
     pub enabled: bool,
 }
@@ -197,6 +206,7 @@ impl From<MeshResourceResponse> for Resource {
             target_port: r.target_port as u16,
             protocol: r.protocol,
             agent_id: r.agent_id,
+            network_id: r.network_id, // SECURITY: Preserve network_id for org-scoping
             port_mode: PortMode::All, // Default to all ports for mesh resources
             ports: None,
         }
@@ -2101,9 +2111,11 @@ async fn handle_quic_stream(
 
         // Look up resource by hostname or mesh_ip to find actual backend (synced from network)
         // Port enforcement: if mesh_port is set (non-zero), only that port is allowed
+        // SECURITY: Network isolation - resources must belong to agent's network
         // Returns: Ok((target_host, target_port, resource_id, Option<Resource>)) or Err((message, resource_id, resource_name, allowed_port, target_host))
         let backend: Result<Option<(String, u16, Option<String>, Option<Resource>)>, (String, Option<String>, Option<String>, Option<u16>, Option<String>)> = {
             let state = state.read().await;
+            let agent_network_id = state.network_id.clone();
 
             // Helper: determine effective target port
             // If resource.target_port is 0, use the request port (passthrough mode)
@@ -2121,9 +2133,32 @@ async fn handle_quic_stream(
                 resource.mesh_port == 0 || resource.mesh_port == request_port
             };
 
+            // SECURITY: Helper to check if resource belongs to agent's network (org isolation)
+            // Resources without network_id are allowed for backwards compatibility
+            // Resources with network_id must match agent's network_id
+            let network_valid = |resource: &Resource| -> bool {
+                match (&resource.network_id, &agent_network_id) {
+                    // Resource has network_id, agent has network_id - must match
+                    (Some(res_net), Some(agent_net)) => {
+                        if res_net != agent_net {
+                            warn!("SECURITY: Blocking cross-network resource access: resource '{}' (network: {}) vs agent network: {}",
+                                resource.name, res_net, agent_net);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    // Resource has no network_id - allow for backwards compatibility
+                    (None, _) => true,
+                    // Agent has no network_id - allow (unbound agent)
+                    (_, None) => true,
+                }
+            };
+
             // First try to find resource by hostname (e.g., echo.dev.int)
+            // SECURITY: Only match resources belonging to this agent's network
             if let Some(resource) = state.resources.values()
-                .find(|r| r.hostname == host)
+                .find(|r| r.hostname == host && network_valid(r))
             {
                 // Enforce port restriction
                 if !port_allowed(resource, port) {
@@ -2145,8 +2180,9 @@ async fn handle_quic_stream(
                 }
             }
             // Then try to find resource by mesh_ip and port
+            // SECURITY: Only match resources belonging to this agent's network
             else if let Some(resource) = state.resources.values()
-                .find(|r| r.mesh_ip == host && r.mesh_port == port)
+                .find(|r| r.mesh_ip == host && r.mesh_port == port && network_valid(r))
             {
                 let target_port = effective_port(resource, port);
                 info!("Found resource '{}' for {}:{} -> {}:{} (configured port: {})",
@@ -2154,8 +2190,9 @@ async fn handle_quic_stream(
                 Ok(Some((resource.target_host.clone(), target_port, Some(resource.id.clone()), Some(resource.clone()))))
             }
             // Also try matching just mesh_ip with any port
+            // SECURITY: Only match resources belonging to this agent's network
             else if let Some(resource) = state.resources.values()
-                .find(|r| r.mesh_ip == host)
+                .find(|r| r.mesh_ip == host && network_valid(r))
             {
                 // Enforce port restriction for mesh_ip matches too
                 if !port_allowed(resource, port) {
