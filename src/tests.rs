@@ -485,8 +485,8 @@ fn test_mesh_resource_response_to_resource() {
         target_port: 5432,
         protocol: "postgresql".to_string(),
         agent_id: "agent_789".to_string(),
-        enabled: true,
         network_id: Some("ntwk_test123".to_string()),
+        enabled: true,
     };
 
     let resource: Resource = response.into();
