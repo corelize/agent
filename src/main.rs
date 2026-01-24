@@ -1369,6 +1369,83 @@ async fn sync_resources(state: &Arc<RwLock<AgentState>>) -> Result<()> {
 }
 
 // =============================================================================
+// Access Control
+// =============================================================================
+
+/// Response from access check endpoint
+#[derive(Debug, Deserialize)]
+struct AccessCheckResponse {
+    has_access: bool,
+    resource_id: Option<String>,
+    resource_name: Option<String>,
+    resource_hostname: Option<String>,
+    network_id: Option<String>,
+    request_url: Option<String>,
+    denial_reason: Option<String>,
+    existing_request_id: Option<String>,
+    existing_request_status: Option<String>,
+}
+
+/// Check if a user has access to a resource
+/// Returns (has_access, denial_reason, request_url) tuple
+/// Returns (true, None, None) if access is granted or check fails (fail-open for backwards compat)
+async fn check_user_access(
+    control_url: &str,
+    auth_key: Option<&str>,
+    user_id: &str,
+    resource_hostname: &str,
+) -> (bool, Option<String>, Option<String>) {
+    // Build URL with query params
+    let url = format!(
+        "{}/api/v1/agents/check-access?user_id={}&resource={}",
+        control_url.trim_end_matches('/'),
+        urlencoding::encode(user_id),
+        urlencoding::encode(resource_hostname)
+    );
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to create HTTP client for access check: {}", e);
+            return (true, None, None); // Fail-open
+        }
+    };
+
+    let mut req_builder = client.get(&url);
+
+    // Add X-Agent-Key header for authentication
+    if let Some(key) = auth_key {
+        req_builder = req_builder.header("X-Agent-Key", key);
+    }
+
+    let response = match req_builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Access check request failed: {}", e);
+            return (true, None, None); // Fail-open on network error
+        }
+    };
+
+    if !response.status().is_success() {
+        warn!("Access check returned status: {}", response.status());
+        return (true, None, None); // Fail-open on server error
+    }
+
+    let check_response: AccessCheckResponse = match response.json().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to parse access check response: {}", e);
+            return (true, None, None); // Fail-open on parse error
+        }
+    };
+
+    (check_response.has_access, check_response.denial_reason, check_response.request_url)
+}
+
+// =============================================================================
 // Backend Proxy (via QUIC streams only, no local TCP listeners)
 // =============================================================================
 
@@ -2288,6 +2365,107 @@ async fn handle_quic_stream(
                 state.server_agent_id.clone(),
             )
         };
+
+        // ACCESS CONTROL: Check if user has access to this resource
+        // Only check if we have both user_id and a known resource
+        if let (Some(ref uid), Some(ref res)) = (&user_id, &resource) {
+            let (has_access, denial_reason, request_url) = check_user_access(
+                &control_url,
+                auth_key.as_deref(),
+                uid,
+                &res.hostname,
+            ).await;
+
+            if !has_access {
+                let reason = denial_reason.unwrap_or_else(|| "Access denied".to_string());
+                let url = request_url.unwrap_or_default();
+
+                warn!("ACCESS DENIED: User {} attempting to access {} - {}", uid, res.hostname, reason);
+
+                // Post audit event for access denied
+                let ctrl_url = control_url.clone();
+                let auth = auth_key.clone();
+                let net_id = network_id.clone();
+                let user_id_clone = user_id.clone();
+                let res_id = resource_id.clone();
+                let res_name = res.name.clone();
+                let hostname = res.hostname.clone();
+                let event = AuditEventRequest {
+                    event_type: AuditEventType::ResourceDenied,
+                    status: AuditStatus::Denied,
+                    user_id: user_id_clone,
+                    network_id: net_id,
+                    resource_id: res_id,
+                    agent_id: None,
+                    source_ip: Some(effective_client_ip.clone()),
+                    target_host: Some(hostname.clone()),
+                    target_port: Some(port as i32),
+                    message: Some(reason.clone()),
+                    details: serde_json::json!({
+                        "resource_name": res_name,
+                        "hostname": hostname,
+                    }),
+                };
+                tokio::spawn(async move {
+                    post_audit_event(&ctrl_url, auth.as_deref(), None, event).await;
+                });
+
+                // For HTTP resources with a request_url, return HTTP 302 redirect
+                // This allows browsers to redirect to the access request form
+                // For non-HTTP or when no request_url, send protocol-level ACCESS_DENIED
+                info!("DEBUG: url value = '{}', url.is_empty() = {}, url.len() = {}", url, url.is_empty(), url.len());
+                if !url.is_empty() {
+                    // Send HTTP 302 redirect to access request form
+                    info!("DEBUG: Taking HTTP 302 redirect branch");
+                    // Use & if URL already has query params, otherwise use ?
+                    let separator = if url.contains('?') { "&" } else { "?" };
+                    let redirect_url = format!("{}{}resource_id={}&resource_name={}&hostname={}",
+                        url,
+                        separator,
+                        urlencoding::encode(&res.id),
+                        urlencoding::encode(&res.name),
+                        urlencoding::encode(&res.hostname)
+                    );
+                    let http_response = format!(
+                        "HTTP/1.1 302 Found\r\n\
+                         Location: {}\r\n\
+                         Content-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         X-Access-Denied: true\r\n\
+                         X-Resource-Id: {}\r\n\
+                         X-Resource-Name: {}\r\n\
+                         X-Denial-Reason: {}\r\n\
+                         \r\n\
+                         {}",
+                        redirect_url,
+                        format!("<html><body><p>Access denied. <a href=\"{}\">Request access</a></p></body></html>", redirect_url).len(),
+                        res.id,
+                        res.name,
+                        reason,
+                        format!("<html><body><p>Access denied. <a href=\"{}\">Request access</a></p></body></html>", redirect_url)
+                    );
+                    info!("Sending HTTP 302 redirect to access request form: {}", redirect_url);
+                    send.write_all(http_response.as_bytes()).await?;
+                } else {
+                    // No request_url, send protocol-level ACCESS_DENIED
+                    // Format: ACCESS_DENIED:resource_id:resource_name:reason:request_url
+                    info!("DEBUG: Taking ACCESS_DENIED text branch (no redirect)");
+                    let response = format!(
+                        "ACCESS_DENIED:{}:{}:{}:{}\n",
+                        res.id,
+                        res.name,
+                        reason,
+                        url
+                    );
+                    send.write_all(response.as_bytes()).await?;
+                }
+                send.finish().ok();
+                return Ok(());
+            }
+
+            info!("ACCESS GRANTED: User {} accessing {}", uid, res.hostname);
+        }
 
         // Post audit event for connection allowed
         {

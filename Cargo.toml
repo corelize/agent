@@ -35,6 +35,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 rand = "0.8"
+urlencoding = "2.1"
 
 # Crypto for Ed25519 keys
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
